@@ -5,21 +5,24 @@ const { EventEmitter } = require("events");
 const { spawn } = require("child_process");
 const { Readable } = require("stream");
 
+const config = require("./config");
 const { resolveYtDlpPath, resolveFfmpegPath, resolveGalleryDlPath } = require("./binaries");
+const { isValidGuestId } = require("./guestSession");
+const { assertSafePublicUrl, safeFetch } = require("./ssrf");
+const storage = require("./storage");
 const {
     normalizeContentType,
     isKnownMediaHost,
     probeDirectHttp,
     buildCookieArgs,
-    withCookieFile,
+    validateCookieOptions,
     getYtDlpBaseArgs,
     resolveShareRedirect,
+    formatExtractorError,
     DEFAULT_HEADERS,
 } = require("./analyzer");
 const {
-    DOWNLOADS_DIR,
     ensureDirSync,
-    validateHttpUrl,
     sanitizeFilename,
     ensureUniquePath,
     parseContentDisposition,
@@ -28,19 +31,76 @@ const {
 class JobManager extends EventEmitter {
     constructor() {
         super();
-        ensureDirSync(DOWNLOADS_DIR);
         this.jobs = new Map();
         this.controllers = new Map();
+        this.queue = [];
+        this.activeCount = 0;
+        this.cleanupTimer = null;
     }
 
-    listJobs() {
-        return Array.from(this.jobs.values()).sort(
-            (a, b) => new Date(b.createdAt) - new Date(a.createdAt)
-        );
+    startCleanupScheduler() {
+        if (this.cleanupTimer) return;
+        this.cleanupTimer = setInterval(() => {
+            try {
+                storage.cleanupExpiredStorage({ fileTtlMs: config.FILE_TTL_MS });
+                this.pruneOldJobs(config.JOB_RETENTION_MS);
+            } catch (err) {
+                console.error("[cleanup] Error during scheduled cleanup:", err.message);
+            }
+        }, config.CLEANUP_INTERVAL_MS);
+        this.cleanupTimer.unref?.();
     }
 
-    getJob(id) {
-        return this.jobs.get(id) || null;
+    stopCleanupScheduler() {
+        if (this.cleanupTimer) {
+            clearInterval(this.cleanupTimer);
+            this.cleanupTimer = null;
+        }
+    }
+
+    pruneOldJobs(retentionMs = config.JOB_RETENTION_MS, nowMs = Date.now()) {
+        let removed = 0;
+        for (const [id, job] of this.jobs.entries()) {
+            const terminal =
+                job.status === "completed" || job.status === "error" || job.status === "cancelled";
+            if (!terminal) continue;
+            const updatedAtMs = new Date(job.updatedAt).getTime();
+            if (Number.isFinite(updatedAtMs) && nowMs - updatedAtMs > retentionMs) {
+                this.jobs.delete(id);
+                removed += 1;
+            }
+        }
+        return removed;
+    }
+
+    listJobs(guestId) {
+        if (!isValidGuestId(guestId)) return [];
+        return Array.from(this.jobs.values())
+            .filter((job) => job.guestId === guestId)
+            .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+    }
+
+    getJob(id, guestId = null) {
+        const job = this.jobs.get(id) || null;
+        if (!job) return null;
+        if (guestId && job.guestId !== guestId) return null;
+        return job;
+    }
+
+    countGuestActiveJobs(guestId) {
+        let count = 0;
+        for (const job of this.jobs.values()) {
+            if (
+                job.guestId === guestId &&
+                (job.status === "queued" ||
+                    job.status === "analyzing" ||
+                    job.status === "downloading" ||
+                    job.status === "merging")
+            ) {
+                count += 1;
+            }
+        }
+        return count;
     }
 
     updateJob(id, patch) {
@@ -51,14 +111,22 @@ class JobManager extends EventEmitter {
         return job;
     }
 
-    cancelJob(id) {
-        const ctrl = this.controllers.get(id);
-        const job = this.jobs.get(id);
+    cancelJob(id, guestId) {
+        const job = this.getJob(id, guestId);
         if (!job) return false;
+
+        // Remove from queue if still queued
+        const qIdx = this.queue.findIndex((item) => item.id === id);
+        if (qIdx !== -1) {
+            this.queue.splice(qIdx, 1);
+        }
+
+        const ctrl = this.controllers.get(id);
         if (ctrl) {
             ctrl.abort();
             this.controllers.delete(id);
         }
+
         if (
             job.status === "queued" ||
             job.status === "analyzing" ||
@@ -74,6 +142,7 @@ class JobManager extends EventEmitter {
     }
 
     async startDownload({
+        guestId,
         url,
         quality = "4k",
         container = "mp4",
@@ -83,18 +152,44 @@ class JobManager extends EventEmitter {
         forceDirect = false,
         contentType = "auto",
     }) {
-        const cleanUrl = validateHttpUrl(url);
+        if (!isValidGuestId(guestId)) {
+            throw new Error("Invalid guest session.");
+        }
+        validateCookieOptions({ cookiesBrowser, cookiesTxt });
+        const cleanUrl = await assertSafePublicUrl(url);
         const normalizedType = normalizeContentType(contentType);
+
+        storage.assertStorageQuota(guestId, 0);
+
+        if (this.countGuestActiveJobs(guestId) >= config.MAX_ACTIVE_PER_GUEST) {
+            const err = new Error(
+                `You can run up to ${config.MAX_ACTIVE_PER_GUEST} active downloads at a time.`
+            );
+            err.statusCode = 429;
+            throw err;
+        }
+
+        if (
+            this.activeCount >= config.MAX_CONCURRENT_DOWNLOADS &&
+            this.queue.length >= config.MAX_QUEUE_SIZE
+        ) {
+            const err = new Error("Server download queue is full. Please try again in a moment.");
+            err.statusCode = 503;
+            throw err;
+        }
+
         const id = crypto.randomUUID().slice(0, 12);
         const now = new Date().toISOString();
+        const isQueued = this.activeCount >= config.MAX_CONCURRENT_DOWNLOADS;
 
         const job = {
             id,
+            guestId,
             url: cleanUrl,
             contentType: normalizedType,
             quality: normalizedType === "audio" ? "audio" : quality,
             container,
-            status: "analyzing",
+            status: isQueued ? "queued" : "analyzing",
             mode: null,
             progress: 0,
             downloadedBytes: 0,
@@ -105,7 +200,7 @@ class JobManager extends EventEmitter {
             files: [],
             title: cleanUrl,
             resolution: null,
-            message: "Inspecting link...",
+            message: isQueued ? "Queued — waiting for an available worker slot..." : "Inspecting link...",
             error: null,
             createdAt: now,
             updatedAt: now,
@@ -114,39 +209,87 @@ class JobManager extends EventEmitter {
         this.jobs.set(id, job);
         this.emit("job", { ...job });
 
-        withCookieFile(cookiesTxt, (tempCookieFilePath) =>
-            this._executeJob(id, {
+        const task = {
+            id,
+            guestId,
+            opts: {
                 url: cleanUrl,
                 quality: job.quality,
                 container,
                 cookiesBrowser,
-                tempCookieFilePath,
                 customFilename,
-                forceDirect,
+                forceDirect: Boolean(forceDirect),
                 contentType: normalizedType,
-            })
-        ).catch((err) => {
-            const current = this.jobs.get(id);
-            if (current && current.status !== "cancelled") {
-                this.updateJob(id, {
-                    status: "error",
-                    error: err.message || "Download failed",
-                    message: err.message || "Download failed",
-                });
-            }
-        });
+            },
+        };
+
+        this.queue.push(task);
+        this._drainQueue();
 
         return { ...job };
     }
 
-    async _executeJob(id, opts) {
+    _drainQueue() {
+        while (this.activeCount < config.MAX_CONCURRENT_DOWNLOADS && this.queue.length > 0) {
+            const task = this.queue.shift();
+            const job = this.jobs.get(task.id);
+            if (!job || job.status === "cancelled") continue;
+
+            this.activeCount += 1;
+            this._runTaskWithTimeout(task)
+                .catch((err) => {
+                    const current = this.jobs.get(task.id);
+                    if (current && current.status !== "cancelled") {
+                        this.updateJob(task.id, {
+                            status: "error",
+                            error: err.message || "Download failed",
+                            message: err.message || "Download failed",
+                        });
+                    }
+                })
+                .finally(() => {
+                    this.activeCount = Math.max(0, this.activeCount - 1);
+                    this._drainQueue();
+                });
+        }
+    }
+
+    async _runTaskWithTimeout(task) {
+        const { id, guestId, opts } = task;
+        this.updateJob(id, { status: "analyzing", message: "Inspecting link..." });
+
+        const timeoutController = new AbortController();
+        const timeoutHandle = setTimeout(() => {
+            timeoutController.abort(new Error("Download exceeded maximum execution time."));
+            const activeCtrl = this.controllers.get(id);
+            if (activeCtrl) activeCtrl.abort();
+        }, config.JOB_TIMEOUT_MS);
+        timeoutHandle.unref?.();
+
+        try {
+            await this._executeJob(id, guestId, opts, timeoutController.signal);
+        } finally {
+            clearTimeout(timeoutHandle);
+        }
+    }
+
+    async _executeJob(id, guestId, opts, timeoutSignal) {
+        if (timeoutSignal.aborted) {
+            throw new Error("Download timed out.");
+        }
+
         const { forceDirect, contentType } = opts;
         const url = await resolveShareRedirect(opts.url);
-        const resolvedOpts = { ...opts, url };
+        await assertSafePublicUrl(url);
+        const resolvedOpts = { ...opts, url, timeoutSignal };
 
-        // 1. Direct file download when forced, when user selected "webpage" (Save HTML), or when user selected "document"
         if (forceDirect || contentType === "webpage") {
             const probe = await probeDirectHttp(url);
+            if (probe?.fileSize && probe.fileSize > config.MAX_DOWNLOAD_BYTES) {
+                throw new Error(
+                    `File exceeds the maximum allowed size (${Math.round(config.MAX_DOWNLOAD_BYTES / (1024 * 1024))} MB).`
+                );
+            }
             this.updateJob(id, {
                 mode: "direct",
                 status: "downloading",
@@ -154,7 +297,14 @@ class JobManager extends EventEmitter {
                 totalBytes: probe?.fileSize || null,
                 message: `Downloading ${probe?.mimeType || "file"}...`,
             });
-            await this._downloadDirect(id, probe?.finalUrl || url, probe, resolvedOpts.customFilename);
+            await this._downloadDirect(
+                id,
+                guestId,
+                probe?.finalUrl || url,
+                probe,
+                resolvedOpts.customFilename,
+                timeoutSignal
+            );
             return;
         }
 
@@ -175,11 +325,17 @@ class JobManager extends EventEmitter {
                 totalBytes: probe.fileSize,
                 message: `Downloading ${probe.category} (${probe.mimeType})...`,
             });
-            await this._downloadDirect(id, probe.finalUrl || url, probe, resolvedOpts.customFilename);
+            await this._downloadDirect(
+                id,
+                guestId,
+                probe.finalUrl || url,
+                probe,
+                resolvedOpts.customFilename,
+                timeoutSignal
+            );
             return;
         }
 
-        // 2. Explicit "image" mode: direct image first -> gallery-dl
         if (contentType === "image") {
             const probe = await probeDirectHttp(url);
             if (probe && probe.isDirectFile) {
@@ -190,7 +346,14 @@ class JobManager extends EventEmitter {
                     totalBytes: probe.fileSize,
                     message: `Downloading ${probe.category} (${probe.mimeType})...`,
                 });
-                await this._downloadDirect(id, probe.finalUrl || url, probe, resolvedOpts.customFilename);
+                await this._downloadDirect(
+                    id,
+                    guestId,
+                    probe.finalUrl || url,
+                    probe,
+                    resolvedOpts.customFilename,
+                    timeoutSignal
+                );
                 return;
             }
             const galleryDlPath = resolveGalleryDlPath();
@@ -201,13 +364,14 @@ class JobManager extends EventEmitter {
                     progress: 10,
                     message: "Extracting image(s) / gallery...",
                 });
-                await this._downloadWithGalleryDl(id, resolvedOpts, galleryDlPath);
+                await this._downloadWithGalleryDl(id, guestId, resolvedOpts, galleryDlPath);
                 return;
             }
-            throw new Error("No direct image or supported gallery found. Try \"Inspect Link\" to extract images from the page.");
+            throw new Error(
+                "No direct image or supported gallery found. Try \"Inspect Link\" to extract images from the page."
+            );
         }
 
-        // 3. Auto / Video / Audio: probe direct files on non-social hosts
         let probe = null;
         if (contentType !== "video" && !isKnownMediaHost(url)) {
             probe = await probeDirectHttp(url);
@@ -219,12 +383,18 @@ class JobManager extends EventEmitter {
                     totalBytes: probe.fileSize,
                     message: `Downloading ${probe.category} (${probe.mimeType})...`,
                 });
-                await this._downloadDirect(id, probe.finalUrl || url, probe, resolvedOpts.customFilename);
+                await this._downloadDirect(
+                    id,
+                    guestId,
+                    probe.finalUrl || url,
+                    probe,
+                    resolvedOpts.customFilename,
+                    timeoutSignal
+                );
                 return;
             }
         }
 
-        // 4. yt-dlp for video/audio links
         let ytErr = null;
         const ytdlpPath = resolveYtDlpPath();
         if (ytdlpPath) {
@@ -234,33 +404,33 @@ class JobManager extends EventEmitter {
                 message: contentType === "audio" ? "Extracting audio stream..." : "Fetching media streams...",
             });
             try {
-                await this._downloadWithYtDlp(id, resolvedOpts, ytdlpPath);
+                await this._downloadWithYtDlp(id, guestId, resolvedOpts, ytdlpPath);
                 return;
             } catch (err) {
                 ytErr = err;
-                if (this.getJob(id)?.status === "cancelled") throw err;
+                if (this.getJob(id)?.status === "cancelled" || timeoutSignal.aborted) throw err;
                 if (contentType === "audio" || contentType === "video") {
                     const directProbe = probe || (await probeDirectHttp(url));
                     if (directProbe && directProbe.isDirectFile) {
                         await this._downloadDirect(
                             id,
+                            guestId,
                             directProbe.finalUrl || url,
                             directProbe,
-                            resolvedOpts.customFilename
+                            resolvedOpts.customFilename,
+                            timeoutSignal
                         );
                         return;
                     }
                     throw err;
                 }
-                // If yt-dlp specifically hit a bot/auth error, do not fall through to gallery-dl and mask the error
                 const msg = err.message || "";
-                if (/sign in|confirm you.?re not a bot|cookies|login|403|blocked/i.test(msg)) {
+                if (/bot|sign in|login|private|age-restricted|rate-limited|unavailable|exceeds/i.test(msg)) {
                     throw err;
                 }
             }
         }
 
-        // 5. Auto fallback: gallery-dl for images/photo posts/carousels
         let galErr = null;
         const galleryDlPath = resolveGalleryDlPath();
         if (galleryDlPath) {
@@ -271,15 +441,14 @@ class JobManager extends EventEmitter {
                 message: "Extracting images / gallery items...",
             });
             try {
-                await this._downloadWithGalleryDl(id, resolvedOpts, galleryDlPath);
+                await this._downloadWithGalleryDl(id, guestId, resolvedOpts, galleryDlPath);
                 return;
             } catch (err) {
                 galErr = err;
-                if (this.getJob(id)?.status === "cancelled") throw err;
+                if (this.getJob(id)?.status === "cancelled" || timeoutSignal.aborted) throw err;
             }
         }
 
-        // 6. Auto final fallback: direct HTTP probe
         const fallbackProbe = probe || (await probeDirectHttp(url));
         if (fallbackProbe && fallbackProbe.isDirectFile) {
             this.updateJob(id, {
@@ -291,32 +460,39 @@ class JobManager extends EventEmitter {
             });
             await this._downloadDirect(
                 id,
+                guestId,
                 fallbackProbe.finalUrl || url,
                 fallbackProbe,
-                resolvedOpts.customFilename
+                resolvedOpts.customFilename,
+                timeoutSignal
             );
             return;
         }
 
-        const primaryError = ytErr?.message || galErr?.message;
         throw new Error(
-            primaryError ||
-                "Could not extract media directly from this link. Try clicking \"Inspect Link\" to view downloadable images/files on the page, or upload a cookies.txt file if login is required."
+            ytErr?.message ||
+                galErr?.message ||
+                "Could not extract media from this link. Try clicking \"Inspect Link\" to check for downloadable files or images."
         );
     }
 
-    async _downloadDirect(id, url, probe, customFilename) {
+    async _downloadDirect(id, guestId, url, probe, customFilename, timeoutSignal) {
+        const guestDir = storage.getGuestDir(guestId);
         const controller = new AbortController();
         this.controllers.set(id, controller);
 
-        const response = await fetch(url, {
+        const onTimeoutAbort = () => controller.abort();
+        timeoutSignal?.addEventListener("abort", onTimeoutAbort, { once: true });
+
+        const { res: response } = await safeFetch(url, {
             method: "GET",
-            redirect: "follow",
             headers: DEFAULT_HEADERS,
             signal: controller.signal,
         });
 
         if (!response.ok || !response.body) {
+            this.controllers.delete(id);
+            timeoutSignal?.removeEventListener("abort", onTimeoutAbort);
             throw new Error(`HTTP ${response.status} while downloading file`);
         }
 
@@ -329,10 +505,14 @@ class JobManager extends EventEmitter {
                 ? Number(contentLengthHeader)
                 : probe?.fileSize || null;
 
+        if (totalBytes !== null) {
+            storage.assertStorageQuota(guestId, totalBytes);
+        }
+
         const targetName = sanitizeFilename(
             customFilename || headerDisposition || probe?.filename || "download.bin"
         );
-        const finalPath = ensureUniquePath(DOWNLOADS_DIR, targetName);
+        const finalPath = ensureUniquePath(guestDir, targetName);
         const partPath = `${finalPath}.part`;
 
         const fileStream = fs.createWriteStream(partPath);
@@ -352,13 +532,25 @@ class JobManager extends EventEmitter {
         try {
             await new Promise((resolve, reject) => {
                 const cleanupAbort = () => {
-                    readable.destroy(new Error("Aborted"));
+                    const reason = timeoutSignal?.aborted
+                        ? new Error("Download timed out.")
+                        : new Error("Aborted");
+                    readable.destroy(reason);
                     fileStream.destroy();
                 };
                 controller.signal.addEventListener("abort", cleanupAbort, { once: true });
 
                 readable.on("data", (chunk) => {
                     downloadedBytes += chunk.length;
+                    if (downloadedBytes > config.MAX_DOWNLOAD_BYTES) {
+                        const limitErr = new Error(
+                            `File exceeds the maximum allowed size (${Math.round(config.MAX_DOWNLOAD_BYTES / (1024 * 1024))} MB).`
+                        );
+                        readable.destroy(limitErr);
+                        fileStream.destroy();
+                        return;
+                    }
+
                     const now = Date.now();
                     const elapsedMs = now - lastTickTime;
                     if (elapsedMs >= 250) {
@@ -392,8 +584,10 @@ class JobManager extends EventEmitter {
                 readable.pipe(fileStream);
             });
 
+            storage.assertStorageQuota(guestId, downloadedBytes);
             fs.renameSync(partPath, finalPath);
             this.controllers.delete(id);
+            timeoutSignal?.removeEventListener("abort", onTimeoutAbort);
 
             this.updateJob(id, {
                 status: "completed",
@@ -408,6 +602,7 @@ class JobManager extends EventEmitter {
             });
         } catch (err) {
             this.controllers.delete(id);
+            timeoutSignal?.removeEventListener("abort", onTimeoutAbort);
             if (fs.existsSync(partPath)) {
                 try {
                     fs.unlinkSync(partPath);
@@ -419,8 +614,9 @@ class JobManager extends EventEmitter {
         }
     }
 
-    _downloadWithGalleryDl(id, opts, galleryDlPath) {
-        const stagingDir = path.join(DOWNLOADS_DIR, `.staging_${id}`);
+    _downloadWithGalleryDl(id, guestId, opts, galleryDlPath) {
+        const guestDir = storage.getGuestDir(guestId);
+        const stagingDir = path.join(guestDir, `.staging_${id}`);
         ensureDirSync(stagingDir);
 
         const args = [
@@ -430,16 +626,23 @@ class JobManager extends EventEmitter {
             "directory=[]",
             "--range",
             "1-30",
-            ...buildCookieArgs(opts.cookiesBrowser, opts.tempCookieFilePath),
+            "--filesize-max",
+            String(config.MAX_DOWNLOAD_BYTES),
+            ...buildCookieArgs(opts.cookiesBrowser),
             opts.url,
         ];
 
         return new Promise((resolve, reject) => {
             const child = spawn(galleryDlPath, args, { stdio: ["ignore", "pipe", "pipe"] });
             const controller = new AbortController();
-            controller.signal.addEventListener("abort", () => {
+            const killChild = () => {
                 child.kill("SIGTERM");
-            });
+                setTimeout(() => {
+                    if (!child.killed) child.kill("SIGKILL");
+                }, 2000).unref?.();
+            };
+            controller.signal.addEventListener("abort", killChild);
+            opts.timeoutSignal?.addEventListener("abort", killChild, { once: true });
             this.controllers.set(id, controller);
 
             const downloadedPaths = [];
@@ -472,20 +675,25 @@ class JobManager extends EventEmitter {
 
             child.on("error", (err) => {
                 this.controllers.delete(id);
+                opts.timeoutSignal?.removeEventListener("abort", killChild);
                 fs.rmSync(stagingDir, { recursive: true, force: true });
                 reject(err);
             });
 
             child.on("close", (code) => {
                 this.controllers.delete(id);
+                opts.timeoutSignal?.removeEventListener("abort", killChild);
                 if (stdoutBuffer.trim()) handleStdoutLine(stdoutBuffer);
 
+                if (opts.timeoutSignal?.aborted) {
+                    fs.rmSync(stagingDir, { recursive: true, force: true });
+                    return reject(new Error("Download timed out."));
+                }
                 if (controller.signal.aborted) {
                     fs.rmSync(stagingDir, { recursive: true, force: true });
                     return reject(new Error("Download cancelled"));
                 }
 
-                // Collect any files written inside stagingDir
                 const stagedFiles = fs.existsSync(stagingDir)
                     ? fs.readdirSync(stagingDir).map((f) => path.join(stagingDir, f))
                     : [];
@@ -494,29 +702,35 @@ class JobManager extends EventEmitter {
                 if (code !== 0 || sourceFiles.length === 0) {
                     fs.rmSync(stagingDir, { recursive: true, force: true });
                     return reject(
-                        new Error(stderrBuffer.trim() || `gallery-dl exited with code ${code}`)
+                        new Error(
+                            formatExtractorError(stderrBuffer.trim() || `gallery-dl exited with code ${code}`)
+                        )
                     );
                 }
 
                 const movedFilenames = [];
                 let totalBytes = 0;
 
-                sourceFiles.forEach((srcPath, index) => {
-                    const ext = path.extname(srcPath);
-                    const originalBase = path.basename(srcPath);
-                    let desiredName = originalBase;
-                    if (opts.customFilename) {
-                        const baseCustom = sanitizeFilename(path.parse(opts.customFilename).name);
-                        desiredName =
-                            sourceFiles.length > 1
-                                ? `${baseCustom}_${index + 1}${ext}`
-                                : `${baseCustom}${ext}`;
-                    }
-                    const destPath = ensureUniquePath(DOWNLOADS_DIR, desiredName);
-                    fs.renameSync(srcPath, destPath);
-                    totalBytes += fs.statSync(destPath).size;
-                    movedFilenames.push(path.basename(destPath));
-                });
+                try {
+                    sourceFiles.forEach((srcPath, index) => {
+                        const ext = path.extname(srcPath);
+                        const originalBase = path.basename(srcPath);
+                        let desiredName = originalBase;
+                        if (opts.customFilename) {
+                            const baseCustom = sanitizeFilename(path.parse(opts.customFilename).name);
+                            desiredName =
+                                sourceFiles.length > 1
+                                    ? `${baseCustom}_${index + 1}${ext}`
+                                    : `${baseCustom}${ext}`;
+                        }
+                        const moved = storage.moveIntoGuestStorage(guestId, srcPath, desiredName);
+                        totalBytes += moved.size;
+                        movedFilenames.push(moved.filename);
+                    });
+                } catch (quotaErr) {
+                    fs.rmSync(stagingDir, { recursive: true, force: true });
+                    return reject(quotaErr);
+                }
 
                 fs.rmSync(stagingDir, { recursive: true, force: true });
 
@@ -574,7 +788,8 @@ class JobManager extends EventEmitter {
         };
     }
 
-    _downloadWithYtDlp(id, opts, ytdlpPath) {
+    _downloadWithYtDlp(id, guestId, opts, ytdlpPath) {
+        const guestDir = storage.getGuestDir(guestId);
         const ffmpegPath = resolveFfmpegPath();
         const { quality = "4k", container = "mp4", cookiesBrowser = "", customFilename = "" } = opts;
         const allowedContainers = new Set(["mp4", "mkv", "webm"]);
@@ -585,7 +800,7 @@ class JobManager extends EventEmitter {
             mergeFormat
         );
 
-        const stagingDir = path.join(DOWNLOADS_DIR, `.staging_${id}`);
+        const stagingDir = path.join(guestDir, `.staging_${id}`);
         ensureDirSync(stagingDir);
 
         const safeQualityTag = sanitizeFilename(quality || "4k");
@@ -599,6 +814,10 @@ class JobManager extends EventEmitter {
             "--no-warnings",
             "--newline",
             "--progress",
+            "--socket-timeout",
+            "20",
+            "--max-filesize",
+            String(config.MAX_DOWNLOAD_BYTES),
             "--progress-template",
             "download:PROGRESS|%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s|%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.total_bytes_estimate)s",
             "--print",
@@ -611,7 +830,7 @@ class JobManager extends EventEmitter {
             ...extraArgs,
             ...(quality !== "audio" && ffmpegPath ? ["--merge-output-format", mergeFormat] : []),
             ...(ffmpegPath ? ["--ffmpeg-location", ffmpegPath] : []),
-            ...buildCookieArgs(cookiesBrowser, opts.tempCookieFilePath),
+            ...buildCookieArgs(cookiesBrowser),
             "-o",
             outputTemplate,
             opts.url,
@@ -620,14 +839,20 @@ class JobManager extends EventEmitter {
         return new Promise((resolve, reject) => {
             const child = spawn(ytdlpPath, args, { stdio: ["ignore", "pipe", "pipe"] });
             const controller = new AbortController();
-            controller.signal.addEventListener("abort", () => {
+            const killChild = () => {
                 child.kill("SIGTERM");
-            });
+                setTimeout(() => {
+                    if (!child.killed) child.kill("SIGKILL");
+                }, 2000).unref?.();
+            };
+            controller.signal.addEventListener("abort", killChild);
+            opts.timeoutSignal?.addEventListener("abort", killChild, { once: true });
             this.controllers.set(id, controller);
 
             let finalFilePath = null;
             let stderrBuffer = "";
             let stdoutBuffer = "";
+            let sizeExceeded = false;
 
             const handleLine = (line) => {
                 const trimmed = line.trim();
@@ -662,6 +887,14 @@ class JobManager extends EventEmitter {
                     const pct = parseFloat((pctStr || "").replace("%", "").trim());
                     const parsedDl = Number(dlBytes);
                     const parsedTotal = Number(totalBytes) || Number(estBytes) || null;
+                    if (
+                        (Number.isFinite(parsedDl) && parsedDl > config.MAX_DOWNLOAD_BYTES) ||
+                        (parsedTotal && parsedTotal > config.MAX_DOWNLOAD_BYTES)
+                    ) {
+                        sizeExceeded = true;
+                        killChild();
+                        return;
+                    }
                     this.updateJob(id, {
                         status: "downloading",
                         progress: Number.isFinite(pct) ? Math.min(99.9, pct) : null,
@@ -707,14 +940,28 @@ class JobManager extends EventEmitter {
 
             child.on("error", (err) => {
                 this.controllers.delete(id);
+                opts.timeoutSignal?.removeEventListener("abort", killChild);
                 fs.rmSync(stagingDir, { recursive: true, force: true });
                 reject(err);
             });
 
             child.on("close", (code) => {
                 this.controllers.delete(id);
+                opts.timeoutSignal?.removeEventListener("abort", killChild);
                 if (stdoutBuffer.trim()) handleLine(stdoutBuffer);
 
+                if (sizeExceeded) {
+                    fs.rmSync(stagingDir, { recursive: true, force: true });
+                    return reject(
+                        new Error(
+                            `File exceeds the maximum allowed size (${Math.round(config.MAX_DOWNLOAD_BYTES / (1024 * 1024))} MB).`
+                        )
+                    );
+                }
+                if (opts.timeoutSignal?.aborted) {
+                    fs.rmSync(stagingDir, { recursive: true, force: true });
+                    return reject(new Error("Download timed out."));
+                }
                 if (controller.signal.aborted) {
                     fs.rmSync(stagingDir, { recursive: true, force: true });
                     return reject(new Error("Download cancelled"));
@@ -728,19 +975,9 @@ class JobManager extends EventEmitter {
                         .join(" ")
                         .trim();
                     const errMsg = cleanErr || stderrBuffer.trim() || `yt-dlp exited with code ${code}`;
-                    return reject(
-                        new Error(
-                            errMsg.includes("cookies") ||
-                                errMsg.includes("Sign in") ||
-                                errMsg.includes("login") ||
-                                errMsg.includes("bot")
-                                ? `${errMsg} — Upload a cookies.txt file under Cookies (required on cloud servers like Render).`
-                                : errMsg
-                        )
-                    );
+                    return reject(new Error(formatExtractorError(errMsg)));
                 }
 
-                // Locate downloaded file (from FINALPATH or fallback to scanning stagingDir)
                 let sourcePath = finalFilePath && fs.existsSync(finalFilePath) ? finalFilePath : null;
                 if (!sourcePath && fs.existsSync(stagingDir)) {
                     const stagedFiles = fs
@@ -752,11 +989,19 @@ class JobManager extends EventEmitter {
 
                 let resolvedName = null;
                 let fileSize = null;
-                if (sourcePath && fs.existsSync(sourcePath)) {
-                    const destPath = ensureUniquePath(DOWNLOADS_DIR, path.basename(sourcePath));
-                    fs.renameSync(sourcePath, destPath);
-                    resolvedName = path.basename(destPath);
-                    fileSize = fs.statSync(destPath).size;
+                try {
+                    if (sourcePath && fs.existsSync(sourcePath)) {
+                        const moved = storage.moveIntoGuestStorage(
+                            guestId,
+                            sourcePath,
+                            path.basename(sourcePath)
+                        );
+                        resolvedName = moved.filename;
+                        fileSize = moved.size;
+                    }
+                } catch (quotaErr) {
+                    fs.rmSync(stagingDir, { recursive: true, force: true });
+                    return reject(quotaErr);
                 }
 
                 fs.rmSync(stagingDir, { recursive: true, force: true });

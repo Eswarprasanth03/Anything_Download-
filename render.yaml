@@ -8,3 +8,23 @@ services:
     envVars:
       - key: NODE_ENV
         value: production
+      - key: PUBLIC_HOSTED_MODE
+        value: "true"
+      - key: SESSION_SECRET
+        generateValue: true
+      - key: MAX_CONCURRENT_DOWNLOADS
+        value: "3"
+      - key: MAX_QUEUE_SIZE
+        value: "20"
+      - key: MAX_ACTIVE_PER_GUEST
+        value: "2"
+      - key: MAX_DOWNLOAD_BYTES
+        value: "524288000"
+      - key: MAX_GUEST_STORAGE_BYTES
+        value: "1073741824"
+      - key: MAX_TOTAL_STORAGE_BYTES
+        value: "4294967296"
+      - key: FILE_TTL_MS
+        value: "3600000"
+      - key: JOB_TIMEOUT_MS
+        value: "300000"

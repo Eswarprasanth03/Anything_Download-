@@ -1,15 +1,10 @@
-const fs = require("fs");
-const os = require("os");
 const path = require("path");
-const crypto = require("crypto");
 const { execFile } = require("child_process");
 const mime = require("mime-types");
+const config = require("./config");
 const { resolveYtDlpPath, resolveGalleryDlPath } = require("./binaries");
-const {
-    validateHttpUrl,
-    sanitizeFilename,
-    parseContentDisposition,
-} = require("./utils");
+const { assertSafePublicUrl, safeFetch, validatePublicHttpUrl } = require("./ssrf");
+const { sanitizeFilename, parseContentDisposition } = require("./utils");
 
 const DEFAULT_HEADERS = {
     "User-Agent":
@@ -46,6 +41,20 @@ const KNOWN_MEDIA_HOSTS = [
     "deviantart.com",
     "tumblr.com",
 ];
+
+const ALLOWED_CONTENT_TYPES = new Set([
+    "auto",
+    "video",
+    "image",
+    "audio",
+    "document",
+    "webpage",
+]);
+
+function normalizeContentType(value) {
+    const normalized = String(value || "auto").trim().toLowerCase();
+    return ALLOWED_CONTENT_TYPES.has(normalized) ? normalized : "auto";
+}
 
 function isKnownMediaHost(urlStr) {
     try {
@@ -101,25 +110,108 @@ function deriveFilenameFromUrl(urlStr, mimeType) {
     return sanitizeFilename(extFromMime ? `${host}.${extFromMime}` : `${host}.bin`);
 }
 
+function formatExtractorError(rawMessage) {
+    const msg = String(rawMessage || "").trim();
+    if (!msg) return "Unable to extract media from this link.";
+
+    if (/confirm you.?re not a bot/i.test(msg)) {
+        return config.PUBLIC_HOSTED_MODE
+            ? "YouTube triggered an anti-bot verification check on this public cloud server. Public guest mode does not bypass YouTube's bot gate; try another source or run the app locally."
+            : "YouTube triggered an anti-bot check. In local mode, select your local browser under Browser Cookies and try again.";
+    }
+    if (/sign in|login required|authentication|cookies|private|followers only|age-restricted/i.test(msg)) {
+        return config.PUBLIC_HOSTED_MODE
+            ? "This content requires login, is private, or is age-restricted. Public guest mode only supports publicly accessible links."
+            : "This content requires login or is age-restricted. In local mode, select your local browser under Browser Cookies and try again.";
+    }
+    if (/429|too many requests|rate.?limit/i.test(msg)) {
+        return "The source platform temporarily rate-limited requests. Please try again later.";
+    }
+    if (/video unavailable|not available in your country|geo.?restricted|has been removed|404|not found/i.test(msg)) {
+        return "This content is unavailable, deleted, or region-restricted on the source platform.";
+    }
+    if (/unsupported url/i.test(msg)) {
+        return "This URL is not supported by the media extractor. Try clicking \"Inspect Link\" to scan for direct files or images on the page.";
+    }
+    if (/file is larger than max-filesize|max.?filesize/i.test(msg)) {
+        return `File exceeds the maximum allowed size (${Math.round(config.MAX_DOWNLOAD_BYTES / (1024 * 1024))} MB).`;
+    }
+    if (/timed out|etimedout|aborted/i.test(msg)) {
+        return "The source server timed out while responding. Please try again.";
+    }
+
+    // Strip internal file paths if any leaked in stderr
+    return msg.replace(/\/[^\s:]+\//g, "").slice(0, 280);
+}
+
+function validateCookieOptions({ cookiesBrowser, cookiesTxt } = {}) {
+    if (cookiesTxt && String(cookiesTxt).trim()) {
+        throw new Error("Visitor cookie uploads are disabled in this deployment.");
+    }
+    if (cookiesBrowser && config.PUBLIC_HOSTED_MODE) {
+        throw new Error("Browser cookie extraction is only available in local development mode.");
+    }
+}
+
+function buildCookieArgs(cookiesBrowser) {
+    if (config.PUBLIC_HOSTED_MODE) {
+        return [];
+    }
+    const allowed = new Set(["chrome", "safari", "firefox", "edge", "brave", "chromium"]);
+    if (cookiesBrowser && allowed.has(String(cookiesBrowser).toLowerCase())) {
+        return ["--cookies-from-browser", String(cookiesBrowser).toLowerCase()];
+    }
+    return [];
+}
+
+function getYtDlpBaseArgs() {
+    return ["--js-runtimes", `node:${process.execPath}`];
+}
+
+async function resolveShareRedirect(urlStr) {
+    try {
+        const parsed = new URL(urlStr);
+        if (/reddit\.com$/i.test(parsed.hostname) && /\/s\//.test(parsed.pathname)) {
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), 8000);
+            try {
+                const { finalUrl } = await safeFetch(urlStr, {
+                    method: "HEAD",
+                    headers: DEFAULT_HEADERS,
+                    signal: controller.signal,
+                });
+                if (finalUrl && !/\/s\//.test(new URL(finalUrl).pathname)) {
+                    return finalUrl;
+                }
+            } finally {
+                clearTimeout(timer);
+            }
+        }
+    } catch {
+        // Keep original URL on failure
+    }
+    return urlStr;
+}
+
 async function probeDirectHttp(urlStr) {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 12000);
 
     try {
-        let res = await fetch(urlStr, {
+        let { res, finalUrl } = await safeFetch(urlStr, {
             method: "HEAD",
-            redirect: "follow",
             headers: DEFAULT_HEADERS,
             signal: controller.signal,
         });
 
         if (res.status === 400 || res.status === 403 || res.status === 405 || res.status === 501) {
-            res = await fetch(urlStr, {
+            const retry = await safeFetch(urlStr, {
                 method: "GET",
-                redirect: "follow",
                 headers: { ...DEFAULT_HEADERS, Range: "bytes=0-1023" },
                 signal: controller.signal,
             });
+            res = retry.res;
+            finalUrl = retry.finalUrl;
             try {
                 await res.body?.cancel();
             } catch {
@@ -147,15 +239,15 @@ async function probeDirectHttp(urlStr) {
             mimeType === "text/html" || mimeType === "application/xhtml+xml" || mimeType === "";
 
         const dispositionName = parseContentDisposition(contentDisposition);
-        const finalUrl = res.url || urlStr;
+        const resolvedUrl = finalUrl || urlStr;
         const filename = sanitizeFilename(
-            dispositionName || deriveFilenameFromUrl(finalUrl, mimeType)
+            dispositionName || deriveFilenameFromUrl(resolvedUrl, mimeType)
         );
 
         return {
             ok: res.ok,
             status: res.status,
-            finalUrl,
+            finalUrl: resolvedUrl,
             mimeType: mimeType || "application/octet-stream",
             category: classifyMime(mimeType),
             fileSize,
@@ -169,76 +261,10 @@ async function probeDirectHttp(urlStr) {
     }
 }
 
-function buildCookieArgs(cookiesBrowser, tempCookieFilePath = null) {
-    if (tempCookieFilePath && fs.existsSync(tempCookieFilePath)) {
-        return ["--cookies", tempCookieFilePath];
-    }
-    const allowed = new Set(["chrome", "safari", "firefox", "edge", "brave", "chromium"]);
-    if (cookiesBrowser && allowed.has(cookiesBrowser.toLowerCase())) {
-        return ["--cookies-from-browser", cookiesBrowser.toLowerCase()];
-    }
-    const secretCookieFile = process.env.COOKIES_FILE || "/etc/secrets/cookies.txt";
-    if (secretCookieFile && fs.existsSync(secretCookieFile)) {
-        return ["--cookies", secretCookieFile];
-    }
-    return [];
-}
-
-async function withCookieFile(cookiesTxt, fn) {
-    if (!cookiesTxt || typeof cookiesTxt !== "string" || !cookiesTxt.trim()) {
-        return fn(null);
-    }
-    const normalized = cookiesTxt.replace(/\r\n/g, "\n").trim() + "\n";
-    if (normalized.length > 512 * 1024) {
-        throw new Error("cookies.txt file is too large (max 512 KB).");
-    }
-    const tmpPath = path.join(os.tmpdir(), `yt_cookies_${crypto.randomUUID()}.txt`);
-    fs.writeFileSync(tmpPath, normalized, { mode: 0o600 });
-    try {
-        return await fn(tmpPath);
-    } finally {
-        try {
-            if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
-        } catch {
-            // Ignore cleanup errors
-        }
-    }
-}
-
-function getYtDlpBaseArgs() {
-    return ["--js-runtimes", `node:${process.execPath}`];
-}
-
-async function resolveShareRedirect(urlStr) {
-    try {
-        const parsed = new URL(urlStr);
-        if (/reddit\.com$/i.test(parsed.hostname) && /\/s\//.test(parsed.pathname)) {
-            const controller = new AbortController();
-            const timer = setTimeout(() => controller.abort(), 8000);
-            try {
-                const res = await fetch(urlStr, {
-                    method: "HEAD",
-                    redirect: "follow",
-                    headers: DEFAULT_HEADERS,
-                    signal: controller.signal,
-                });
-                if (res.url && !/\/s\//.test(new URL(res.url).pathname)) {
-                    return res.url;
-                }
-            } finally {
-                clearTimeout(timer);
-            }
-        }
-    } catch {
-        // Keep original URL on failure
-    }
-    return urlStr;
-}
-
-function runYtDlpJson(urlStr, { cookiesBrowser, tempCookieFilePath } = {}) {
+function runYtDlpJson(urlStr, { cookiesBrowser } = {}) {
     const ytdlpPath = resolveYtDlpPath();
     if (!ytdlpPath) {
-        return Promise.reject(new Error("yt-dlp binary is not installed."));
+        return Promise.reject(new Error("Media extractor (yt-dlp) is not available."));
     }
 
     const args = [
@@ -247,7 +273,9 @@ function runYtDlpJson(urlStr, { cookiesBrowser, tempCookieFilePath } = {}) {
         "--no-warnings",
         "--no-playlist",
         "--skip-download",
-        ...buildCookieArgs(cookiesBrowser, tempCookieFilePath),
+        "--socket-timeout",
+        "20",
+        ...buildCookieArgs(cookiesBrowser),
         urlStr,
     ];
 
@@ -259,30 +287,30 @@ function runYtDlpJson(urlStr, { cookiesBrowser, tempCookieFilePath } = {}) {
             (err, stdout, stderr) => {
                 if (err) {
                     const message = (stderr || err.message || "yt-dlp failed").trim();
-                    return reject(new Error(message));
+                    return reject(new Error(formatExtractorError(message)));
                 }
                 try {
                     const parsed = JSON.parse(stdout);
                     resolve(parsed);
-                } catch (parseErr) {
-                    reject(new Error(`Failed to parse media info: ${parseErr.message}`));
+                } catch {
+                    reject(new Error("Failed to parse media metadata from this link."));
                 }
             }
         );
     });
 }
 
-function runGalleryDlJson(urlStr, { cookiesBrowser, tempCookieFilePath } = {}) {
+function runGalleryDlJson(urlStr, { cookiesBrowser } = {}) {
     const galleryDlPath = resolveGalleryDlPath();
     if (!galleryDlPath) {
-        return Promise.reject(new Error("gallery-dl is not installed."));
+        return Promise.reject(new Error("Gallery extractor (gallery-dl) is not available."));
     }
 
     const args = [
         "--dump-json",
         "--range",
         "1-30",
-        ...buildCookieArgs(cookiesBrowser, tempCookieFilePath),
+        ...buildCookieArgs(cookiesBrowser),
         urlStr,
     ];
 
@@ -294,12 +322,12 @@ function runGalleryDlJson(urlStr, { cookiesBrowser, tempCookieFilePath } = {}) {
             (err, stdout, stderr) => {
                 if (err) {
                     const message = (stderr || err.message || "gallery-dl failed").trim();
-                    return reject(new Error(message));
+                    return reject(new Error(formatExtractorError(message)));
                 }
                 try {
                     const entries = JSON.parse(stdout);
                     if (!Array.isArray(entries)) {
-                        return reject(new Error("Unexpected gallery-dl response"));
+                        return reject(new Error("Unexpected gallery extractor response."));
                     }
                     const items = [];
                     let meta = {};
@@ -308,8 +336,20 @@ function runGalleryDlJson(urlStr, { cookiesBrowser, tempCookieFilePath } = {}) {
                         if (entry[0] === 2 && entry[1] && typeof entry[1] === "object") {
                             meta = { ...meta, ...entry[1] };
                         } else if (entry[0] === 3 && typeof entry[1] === "string") {
+                            try {
+                                validatePublicHttpUrl(entry[1], {
+                                    allowPrivateForTests:
+                                        process.env.NODE_ENV === "test" &&
+                                        process.env.ALLOW_TEST_LOCALHOST === "1",
+                                });
+                            } catch {
+                                continue;
+                            }
                             const itemMeta = entry[2] && typeof entry[2] === "object" ? entry[2] : {};
-                            const ext = itemMeta.extension || path.extname(new URL(entry[1]).pathname).replace(".", "") || "jpg";
+                            const ext =
+                                itemMeta.extension ||
+                                path.extname(new URL(entry[1]).pathname).replace(".", "") ||
+                                "jpg";
                             const base = itemMeta.filename || itemMeta.id || `item_${items.length + 1}`;
                             items.push({
                                 url: entry[1],
@@ -322,11 +362,11 @@ function runGalleryDlJson(urlStr, { cookiesBrowser, tempCookieFilePath } = {}) {
                         }
                     }
                     if (items.length === 0) {
-                        return reject(new Error("No downloadable media items found"));
+                        return reject(new Error("No downloadable media items found at this link."));
                     }
                     resolve({ meta, items });
-                } catch (parseErr) {
-                    reject(new Error(`Failed to parse gallery info: ${parseErr.message}`));
+                } catch {
+                    reject(new Error("Failed to parse gallery metadata from this link."));
                 }
             }
         );
@@ -439,43 +479,58 @@ async function extractWebpageAssets(urlStr) {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 12000);
     try {
-        const res = await fetch(urlStr, {
+        const { res, finalUrl } = await safeFetch(urlStr, {
             method: "GET",
-            redirect: "follow",
             headers: DEFAULT_HEADERS,
             signal: controller.signal,
         });
         if (!res.ok) return { title: null, assets: [] };
         const html = (await res.text()).slice(0, 1024 * 1024);
-        const base = res.url || urlStr;
+        const base = finalUrl || urlStr;
         const found = new Map();
 
         const titleMatch = html.match(/<title[^>]*>([^<]+)<\/title>/i);
         const pageTitle = titleMatch ? titleMatch[1].trim() : null;
 
         const addAsset = (rawUrl, category = "file", explicitExt = null) => {
-            if (!rawUrl || rawUrl.startsWith("data:") || rawUrl.startsWith("javascript:") || rawUrl.startsWith("#")) {
+            if (
+                !rawUrl ||
+                rawUrl.startsWith("data:") ||
+                rawUrl.startsWith("javascript:") ||
+                rawUrl.startsWith("#")
+            ) {
                 return;
             }
             try {
-                const resolved = new URL(rawUrl, base).toString();
+                const resolved = validatePublicHttpUrl(new URL(rawUrl, base).toString(), {
+                    allowPrivateForTests:
+                        process.env.NODE_ENV === "test" &&
+                        process.env.ALLOW_TEST_LOCALHOST === "1",
+                });
                 if (found.has(resolved) || found.size >= 40) return;
                 const urlExt = path.extname(new URL(resolved).pathname).replace(".", "").toLowerCase();
-                const ext = explicitExt || urlExt || (category === "image" ? "img" : category === "video" ? "mp4" : "file");
+                const ext =
+                    explicitExt ||
+                    urlExt ||
+                    (category === "image" ? "img" : category === "video" ? "mp4" : "file");
                 found.set(resolved, {
                     url: resolved,
-                    filename: deriveFilenameFromUrl(resolved, category === "image" && !urlExt ? "image/jpeg" : null),
+                    filename: deriveFilenameFromUrl(
+                        resolved,
+                        category === "image" && !urlExt ? "image/jpeg" : null
+                    ),
                     ext,
                     category,
                 });
             } catch {
-                // Ignore invalid URLs
+                // Ignore invalid or private URLs
             }
         };
 
-        // 1. OpenGraph & Twitter card media meta tags (often extensionless CDN URLs)
-        const metaRegex = /<meta\b[^>]*?(?:property|name)\s*=\s*["'](og:image(?::secure_url)?|twitter:image(?::src)?|og:video(?::url|:secure_url)?)["'][^>]*?content\s*=\s*["']([^"']+)["'][^>]*>/gi;
-        const metaRegexRev = /<meta\b[^>]*?content\s*=\s*["']([^"']+)["'][^>]*?(?:property|name)\s*=\s*["'](og:image(?::secure_url)?|twitter:image(?::src)?|og:video(?::url|:secure_url)?)["'][^>]*>/gi;
+        const metaRegex =
+            /<meta\b[^>]*?(?:property|name)\s*=\s*["'](og:image(?::secure_url)?|twitter:image(?::src)?|og:video(?::url|:secure_url)?)["'][^>]*?content\s*=\s*["']([^"']+)["'][^>]*>/gi;
+        const metaRegexRev =
+            /<meta\b[^>]*?content\s*=\s*["']([^"']+)["'][^>]*?(?:property|name)\s*=\s*["'](og:image(?::secure_url)?|twitter:image(?::src)?|og:video(?::url|:secure_url)?)["'][^>]*>/gi;
 
         let match;
         while ((match = metaRegex.exec(html)) !== null) {
@@ -487,14 +542,12 @@ async function extractWebpageAssets(urlStr) {
             addAsset(match[1].trim(), key.includes("video") ? "video" : "image");
         }
 
-        // 2. Responsive srcset attributes (images)
         const srcsetRegex = /\bsrcset\s*=\s*["']([^"']+)["']/gi;
         while ((match = srcsetRegex.exec(html)) !== null) {
             const best = pickBestSrcsetCandidate(match[1], base);
             if (best) addAsset(best, "image");
         }
 
-        // 3. Explicit <img>, <video>, <audio>, <source> tags (even if extensionless)
         const imgTagRegex = /<img\b[^>]*?\b(?:src|data-src)\s*=\s*["']([^"']+)["'][^>]*>/gi;
         while ((match = imgTagRegex.exec(html)) !== null) {
             addAsset(match[1].trim(), "image");
@@ -505,7 +558,6 @@ async function extractWebpageAssets(urlStr) {
             addAsset(match[1].trim(), "video");
         }
 
-        // 4. Direct file links (<a href="...">, etc.) for any file type
         const attrRegex = /(?:src|href|content)\s*=\s*["']([^"']+)["']/gi;
         const assetExtRegex =
             /\.(mp4|webm|mov|m4v|mkv|mp3|m4a|wav|flac|ogg|aac|png|jpe?g|webp|avif|heic|gif|svg|ico|pdf|docx?|xlsx?|pptx?|txt|csv|json|xml|zip|tar|gz|tgz|bz2|xz|7z|rar|dmg|pkg|exe|msi|apk|ipa|iso|epub|mobi|woff2?|ttf|otf)(\?.*)?$/i;
@@ -534,219 +586,29 @@ async function extractWebpageAssets(urlStr) {
     }
 }
 
-const ALLOWED_CONTENT_TYPES = new Set([
-    "auto",
-    "video",
-    "image",
-    "audio",
-    "document",
-    "webpage",
-]);
-
-function normalizeContentType(value) {
-    const normalized = String(value || "auto").trim().toLowerCase();
-    return ALLOWED_CONTENT_TYPES.has(normalized) ? normalized : "auto";
-}
-
 async function analyzeUrl(rawUrl, options = {}) {
-    const initialUrl = validateHttpUrl(rawUrl);
+    validateCookieOptions(options);
+    const initialUrl = await assertSafePublicUrl(rawUrl);
     const urlStr = await resolveShareRedirect(initialUrl);
     const contentType = normalizeContentType(options.contentType);
 
-    return withCookieFile(options.cookiesTxt, async (tempCookieFilePath) => {
-        const execOpts = { ...options, tempCookieFilePath };
+    if (contentType === "webpage") {
+        const { title: pageTitle, assets } = await extractWebpageAssets(urlStr);
+        return {
+            kind: "webpage",
+            url: urlStr,
+            title: pageTitle || new URL(urlStr).hostname,
+            platform: new URL(urlStr).hostname.replace(/^www\./, ""),
+            assets,
+            allowHtmlSave: true,
+            note:
+                assets.length > 0
+                    ? "Extracted downloadable images, media, and files from this webpage."
+                    : "No embedded assets found; you can save the webpage HTML directly.",
+        };
+    }
 
-        // Explicit "webpage" mode: extract all images, videos, and downloadable files from HTML
-        if (contentType === "webpage") {
-            const { title: pageTitle, assets } = await extractWebpageAssets(urlStr);
-            return {
-                kind: "webpage",
-                url: urlStr,
-                title: pageTitle || new URL(urlStr).hostname,
-                platform: new URL(urlStr).hostname.replace(/^www\./, ""),
-                assets,
-                allowHtmlSave: true,
-                note:
-                    assets.length > 0
-                        ? "Extracted downloadable images, media, and files from this webpage."
-                        : "No embedded assets found; you can save the webpage HTML directly.",
-            };
-        }
-
-        // Explicit "document" mode: probe direct HTTP file first, else scan page for downloadable files
-        if (contentType === "document") {
-            const probe = await probeDirectHttp(urlStr);
-            if (probe && probe.isDirectFile) {
-                return {
-                    kind: "direct",
-                    url: probe.finalUrl,
-                    originalUrl: urlStr,
-                    filename: probe.filename,
-                    mimeType: probe.mimeType,
-                    category: probe.category,
-                    fileSize: probe.fileSize,
-                    title: probe.filename,
-                    platform: new URL(probe.finalUrl).hostname.replace(/^www\./, ""),
-                };
-            }
-
-            const { title: pageTitle, assets } = await extractWebpageAssets(urlStr);
-            const docAssets = assets.filter((a) => a.category === "file" || a.category === "audio");
-            return {
-                kind: "webpage",
-                url: urlStr,
-                title: pageTitle || new URL(urlStr).hostname,
-                platform: new URL(urlStr).hostname.replace(/^www\./, ""),
-                assets: docAssets.length > 0 ? docAssets : assets,
-                allowHtmlSave: true,
-                note:
-                    docAssets.length > 0
-                        ? "Link returned a webpage; detected downloadable documents & files on the page."
-                        : "Link returned a webpage rather than a direct file. Pick an asset below or save the HTML.",
-            };
-        }
-
-        // Explicit "image" mode: check direct image -> gallery-dl (IG/X/Reddit/Pinterest) -> webpage images
-        if (contentType === "image") {
-            const probe = await probeDirectHttp(urlStr);
-            if (probe && probe.isDirectFile) {
-                return {
-                    kind: "direct",
-                    url: probe.finalUrl,
-                    originalUrl: urlStr,
-                    filename: probe.filename,
-                    mimeType: probe.mimeType,
-                    category: probe.category,
-                    fileSize: probe.fileSize,
-                    title: probe.filename,
-                    platform: new URL(probe.finalUrl).hostname.replace(/^www\./, ""),
-                };
-            }
-
-            try {
-                const gallery = await runGalleryDlJson(urlStr, execOpts);
-                const title =
-                    gallery.meta.description ||
-                    gallery.meta.title ||
-                    gallery.meta.content ||
-                    `Images from ${new URL(urlStr).hostname.replace(/^www\./, "")}`;
-                return {
-                    kind: "gallery",
-                    url: urlStr,
-                    title: String(title).slice(0, 140),
-                    uploader: gallery.meta.username || gallery.meta.author?.name || gallery.meta.user?.name || null,
-                    platform: gallery.meta.category || new URL(urlStr).hostname.replace(/^www\./, ""),
-                    itemCount: gallery.items.length,
-                    items: gallery.items,
-                };
-            } catch (galErr) {
-                const { title: pageTitle, assets } = await extractWebpageAssets(urlStr);
-                const imgAssets = assets.filter((a) => a.category === "image");
-                if (imgAssets.length > 0) {
-                    return {
-                        kind: "webpage",
-                        url: urlStr,
-                        title: pageTitle || new URL(urlStr).hostname,
-                        platform: new URL(urlStr).hostname.replace(/^www\./, ""),
-                        assets: imgAssets,
-                        allowHtmlSave: false,
-                        note: `Found ${imgAssets.length} image(s) on this page.`,
-                    };
-                }
-                throw new Error(
-                    galErr.message ||
-                        "No downloadable images found at this link. Upload a cookies.txt file if login is required."
-                );
-            }
-        }
-
-        // For auto / audio on non-social hosts, probe HTTP headers first to detect direct files
-        if (contentType !== "video" && !isKnownMediaHost(urlStr)) {
-            const probe = await probeDirectHttp(urlStr);
-            if (probe && probe.isDirectFile) {
-                return {
-                    kind: "direct",
-                    url: probe.finalUrl,
-                    originalUrl: urlStr,
-                    filename: probe.filename,
-                    mimeType: probe.mimeType,
-                    category: probe.category,
-                    fileSize: probe.fileSize,
-                    title: probe.filename,
-                    platform: new URL(probe.finalUrl).hostname.replace(/^www\./, ""),
-                };
-            }
-        }
-
-        // Try yt-dlp extraction (video or audio mode, and primary path for auto)
-        let ytErrMessage = null;
-        try {
-            const info = await runYtDlpJson(urlStr, execOpts);
-            const isCarousel = info._type === "playlist" && Array.isArray(info.entries);
-            const primaryEntry = isCarousel ? info.entries[0] || info : info;
-            const summary = summarizeMediaFormats(primaryEntry);
-
-            if (contentType === "audio") {
-                summary.presets = summary.presets.filter((p) => p.id === "audio");
-            }
-
-            return {
-                kind: "media",
-                url: urlStr,
-                title: info.title || primaryEntry.title || "Media Download",
-                uploader: info.uploader || info.channel || primaryEntry.uploader || null,
-                duration: info.duration || primaryEntry.duration || null,
-                thumbnail: info.thumbnail || primaryEntry.thumbnail || null,
-                platform: info.extractor_key || info.extractor || "Media",
-                isCarousel,
-                entryCount: isCarousel ? info.entries.length : 1,
-                ...summary,
-            };
-        } catch (ytErr) {
-            ytErrMessage = ytErr.message;
-        }
-
-        // If explicitly video or audio failed yt-dlp, check if URL is actually a direct video/audio file
-        if (contentType === "video" || contentType === "audio") {
-            const probe = await probeDirectHttp(urlStr);
-            if (probe && probe.isDirectFile) {
-                return {
-                    kind: "direct",
-                    url: probe.finalUrl,
-                    originalUrl: urlStr,
-                    filename: probe.filename,
-                    mimeType: probe.mimeType,
-                    category: probe.category,
-                    fileSize: probe.fileSize,
-                    title: probe.filename,
-                    platform: new URL(probe.finalUrl).hostname.replace(/^www\./, ""),
-                };
-            }
-            throw new Error(ytErrMessage || `Could not extract ${contentType} from this link.`);
-        }
-
-        // Auto fallback 2: gallery-dl extraction
-        try {
-            const gallery = await runGalleryDlJson(urlStr, execOpts);
-            const title =
-                gallery.meta.description ||
-                gallery.meta.title ||
-                gallery.meta.content ||
-                `Gallery from ${new URL(urlStr).hostname.replace(/^www\./, "")}`;
-            return {
-                kind: "gallery",
-                url: urlStr,
-                title: String(title).slice(0, 140),
-                uploader: gallery.meta.username || gallery.meta.author?.name || gallery.meta.user?.name || null,
-                platform: gallery.meta.category || new URL(urlStr).hostname.replace(/^www\./, ""),
-                itemCount: gallery.items.length,
-                items: gallery.items,
-            };
-        } catch {
-            // Fall through to direct probe & webpage asset extraction
-        }
-
-        // Auto fallback 3: Direct HTTP probe
+    if (contentType === "document") {
         const probe = await probeDirectHttp(urlStr);
         if (probe && probe.isDirectFile) {
             return {
@@ -762,21 +624,190 @@ async function analyzeUrl(rawUrl, options = {}) {
             };
         }
 
-        // Auto fallback 4: Webpage asset extraction
         const { title: pageTitle, assets } = await extractWebpageAssets(urlStr);
+        const docAssets = assets.filter((a) => a.category === "file" || a.category === "audio");
         return {
             kind: "webpage",
             url: urlStr,
             title: pageTitle || new URL(urlStr).hostname,
             platform: new URL(urlStr).hostname.replace(/^www\./, ""),
-            assets,
+            assets: docAssets.length > 0 ? docAssets : assets,
             allowHtmlSave: true,
             note:
-                assets.length > 0
-                    ? "Detected downloadable images, media, and files on this page."
-                    : ytErrMessage || "No embedded media matched; you can still save the webpage HTML.",
+                docAssets.length > 0
+                    ? "Link returned a webpage; detected downloadable documents & files on the page."
+                    : "Link returned a webpage rather than a direct file. Pick an asset below or save the HTML.",
         };
-    });
+    }
+
+    if (contentType === "image") {
+        const probe = await probeDirectHttp(urlStr);
+        if (probe && probe.isDirectFile) {
+            return {
+                kind: "direct",
+                url: probe.finalUrl,
+                originalUrl: urlStr,
+                filename: probe.filename,
+                mimeType: probe.mimeType,
+                category: probe.category,
+                fileSize: probe.fileSize,
+                title: probe.filename,
+                platform: new URL(probe.finalUrl).hostname.replace(/^www\./, ""),
+            };
+        }
+
+        try {
+            const gallery = await runGalleryDlJson(urlStr, options);
+            const title =
+                gallery.meta.description ||
+                gallery.meta.title ||
+                gallery.meta.content ||
+                `Images from ${new URL(urlStr).hostname.replace(/^www\./, "")}`;
+            return {
+                kind: "gallery",
+                url: urlStr,
+                title: String(title).slice(0, 140),
+                uploader:
+                    gallery.meta.username ||
+                    gallery.meta.author?.name ||
+                    gallery.meta.user?.name ||
+                    null,
+                platform: gallery.meta.category || new URL(urlStr).hostname.replace(/^www\./, ""),
+                itemCount: gallery.items.length,
+                items: gallery.items,
+            };
+        } catch (galErr) {
+            const { title: pageTitle, assets } = await extractWebpageAssets(urlStr);
+            const imgAssets = assets.filter((a) => a.category === "image");
+            if (imgAssets.length > 0) {
+                return {
+                    kind: "webpage",
+                    url: urlStr,
+                    title: pageTitle || new URL(urlStr).hostname,
+                    platform: new URL(urlStr).hostname.replace(/^www\./, ""),
+                    assets: imgAssets,
+                    allowHtmlSave: false,
+                    note: `Found ${imgAssets.length} image(s) on this page.`,
+                };
+            }
+            throw new Error(galErr.message || "No downloadable images found at this link.");
+        }
+    }
+
+    if (contentType !== "video" && !isKnownMediaHost(urlStr)) {
+        const probe = await probeDirectHttp(urlStr);
+        if (probe && probe.isDirectFile) {
+            return {
+                kind: "direct",
+                url: probe.finalUrl,
+                originalUrl: urlStr,
+                filename: probe.filename,
+                mimeType: probe.mimeType,
+                category: probe.category,
+                fileSize: probe.fileSize,
+                title: probe.filename,
+                platform: new URL(probe.finalUrl).hostname.replace(/^www\./, ""),
+            };
+        }
+    }
+
+    let ytErrMessage = null;
+    try {
+        const info = await runYtDlpJson(urlStr, options);
+        const isCarousel = info._type === "playlist" && Array.isArray(info.entries);
+        const primaryEntry = isCarousel ? info.entries[0] || info : info;
+        const summary = summarizeMediaFormats(primaryEntry);
+
+        if (contentType === "audio") {
+            summary.presets = summary.presets.filter((p) => p.id === "audio");
+        }
+
+        return {
+            kind: "media",
+            url: urlStr,
+            title: info.title || primaryEntry.title || "Media Download",
+            uploader: info.uploader || info.channel || primaryEntry.uploader || null,
+            duration: info.duration || primaryEntry.duration || null,
+            thumbnail: info.thumbnail || primaryEntry.thumbnail || null,
+            platform: info.extractor_key || info.extractor || "Media",
+            isCarousel,
+            entryCount: isCarousel ? info.entries.length : 1,
+            ...summary,
+        };
+    } catch (ytErr) {
+        ytErrMessage = ytErr.message;
+    }
+
+    if (contentType === "video" || contentType === "audio") {
+        const probe = await probeDirectHttp(urlStr);
+        if (probe && probe.isDirectFile) {
+            return {
+                kind: "direct",
+                url: probe.finalUrl,
+                originalUrl: urlStr,
+                filename: probe.filename,
+                mimeType: probe.mimeType,
+                category: probe.category,
+                fileSize: probe.fileSize,
+                title: probe.filename,
+                platform: new URL(probe.finalUrl).hostname.replace(/^www\./, ""),
+            };
+        }
+        throw new Error(ytErrMessage || `Could not extract ${contentType} from this link.`);
+    }
+
+    try {
+        const gallery = await runGalleryDlJson(urlStr, options);
+        const title =
+            gallery.meta.description ||
+            gallery.meta.title ||
+            gallery.meta.content ||
+            `Gallery from ${new URL(urlStr).hostname.replace(/^www\./, "")}`;
+        return {
+            kind: "gallery",
+            url: urlStr,
+            title: String(title).slice(0, 140),
+            uploader:
+                gallery.meta.username ||
+                gallery.meta.author?.name ||
+                gallery.meta.user?.name ||
+                null,
+            platform: gallery.meta.category || new URL(urlStr).hostname.replace(/^www\./, ""),
+            itemCount: gallery.items.length,
+            items: gallery.items,
+        };
+    } catch {
+        // Fall through
+    }
+
+    const probe = await probeDirectHttp(urlStr);
+    if (probe && probe.isDirectFile) {
+        return {
+            kind: "direct",
+            url: probe.finalUrl,
+            originalUrl: urlStr,
+            filename: probe.filename,
+            mimeType: probe.mimeType,
+            category: probe.category,
+            fileSize: probe.fileSize,
+            title: probe.filename,
+            platform: new URL(probe.finalUrl).hostname.replace(/^www\./, ""),
+        };
+    }
+
+    const { title: pageTitle, assets } = await extractWebpageAssets(urlStr);
+    return {
+        kind: "webpage",
+        url: urlStr,
+        title: pageTitle || new URL(urlStr).hostname,
+        platform: new URL(urlStr).hostname.replace(/^www\./, ""),
+        assets,
+        allowHtmlSave: true,
+        note:
+            assets.length > 0
+                ? "Detected downloadable images, media, and files on this page."
+                : ytErrMessage || "No embedded media matched; you can still save the webpage HTML.",
+    };
 }
 
 module.exports = {
@@ -785,8 +816,9 @@ module.exports = {
     isKnownMediaHost,
     probeDirectHttp,
     buildCookieArgs,
-    withCookieFile,
+    validateCookieOptions,
     getYtDlpBaseArgs,
     resolveShareRedirect,
+    formatExtractorError,
     DEFAULT_HEADERS,
 };

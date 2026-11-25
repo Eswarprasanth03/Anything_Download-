@@ -3,7 +3,8 @@
 <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Universal Link &amp; 4K Media Downloader</title>
+    <meta name="api-base-url" content="" />
+    <title>Anything Download — Universal Link &amp; 4K Media Downloader</title>
     <link rel="stylesheet" href="/styles.css" />
 </head>
 <body>
@@ -13,7 +14,7 @@
                 <div class="brand-icon">↓</div>
                 <div>
                     <h1>Universal Downloader</h1>
-                    <p class="subtitle">Download images, documents, archives, audio &amp; 4K / 1080p video from any link</p>
+                    <p class="subtitle">Download images, documents, archives, audio &amp; 4K / 1080p video from publicly accessible links</p>
                 </div>
             </div>
             <div class="engine-status" id="engineStatus">
@@ -75,16 +76,15 @@
                             </select>
                         </div>
 
-                        <div class="option-group">
-                            <label for="cookiesSelect">Authentication / Cookies</label>
+                        <div class="option-group hidden" id="cookiesGroup">
+                            <label for="cookiesSelect">Browser Cookies (Local Dev Only)</label>
                             <select id="cookiesSelect">
                                 <option value="" selected>None (Public links)</option>
-                                <option value="cookies_txt">Upload / Paste cookies.txt (Render / Cloud)</option>
-                                <option value="chrome">Chrome (Local machine only)</option>
-                                <option value="safari">Safari (Local machine only)</option>
-                                <option value="firefox">Firefox (Local machine only)</option>
-                                <option value="brave">Brave (Local machine only)</option>
-                                <option value="edge">Edge (Local machine only)</option>
+                                <option value="chrome">Google Chrome</option>
+                                <option value="safari">Safari</option>
+                                <option value="firefox">Firefox</option>
+                                <option value="brave">Brave</option>
+                                <option value="edge">Microsoft Edge</option>
                             </select>
                         </div>
 
@@ -92,23 +92,6 @@
                             <label for="filenameInput">Custom Filename (optional)</label>
                             <input id="filenameInput" type="text" placeholder="Auto-detect from link" />
                         </div>
-                    </div>
-
-                    <div id="cookiesTxtPanel" class="cookies-panel hidden">
-                        <div class="cookies-panel-header">
-                            <div>
-                                <strong>Netscape cookies.txt <span id="cookiesStatusBadge" class="pill pill-muted">Not loaded</span></strong>
-                                <p class="section-sub">Export using a browser extension like "Get cookies.txt LOCALLY" (ideally from a fresh Incognito window), then upload or paste below. Sent per request and deleted immediately after completion.</p>
-                            </div>
-                            <div class="cookies-panel-actions">
-                                <label class="btn btn-secondary btn-sm file-upload-label">
-                                    Upload .txt
-                                    <input id="cookiesFileInput" type="file" accept=".txt,text/plain" class="sr-only" />
-                                </label>
-                                <button type="button" id="clearCookiesBtn" class="btn btn-danger btn-sm">Clear</button>
-                            </div>
-                        </div>
-                        <textarea id="cookiesTxtArea" rows="3" placeholder="# Netscape HTTP Cookie File&#10;.youtube.com&#9;TRUE&#9;/&#9;TRUE&#9;..."></textarea>
                     </div>
                 </form>
 
@@ -131,7 +114,7 @@
                 <div class="section-header">
                     <div>
                         <h2>Saved Files</h2>
-                        <p class="section-sub" id="downloadsDirLabel"></p>
+                        <p class="section-sub" id="downloadsDirLabel">Isolated temporary guest storage</p>
                     </div>
                     <button type="button" id="refreshFilesBtn" class="btn btn-ghost btn-sm">Refresh</button>
                 </div>

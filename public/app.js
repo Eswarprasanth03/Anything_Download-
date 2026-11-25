@@ -9,24 +9,9 @@ const qualityGroup = document.getElementById("qualityGroup");
 const containerGroup = document.getElementById("containerGroup");
 const contentTypePills = document.getElementById("contentTypePills");
 const contentTypeHint = document.getElementById("contentTypeHint");
+const cookiesGroup = document.getElementById("cookiesGroup");
 const cookiesSelect = document.getElementById("cookiesSelect");
-const cookiesTxtPanel = document.getElementById("cookiesTxtPanel");
-const cookiesFileInput = document.getElementById("cookiesFileInput");
-const cookiesTxtArea = document.getElementById("cookiesTxtArea");
-const clearCookiesBtn = document.getElementById("clearCookiesBtn");
-const cookiesStatusBadge = document.getElementById("cookiesStatusBadge");
 const filenameInput = document.getElementById("filenameInput");
-
-let selectedContentType = "auto";
-
-const CONTENT_TYPE_HINTS = {
-    auto: "Automatically detects video, image, audio, or direct file",
-    video: "Downloads video in 4K / 1080p+ from YouTube, Instagram, X, TikTok, or direct MP4/MKV",
-    image: "Downloads original-resolution images & carousels from Instagram, X, Pinterest, Reddit, or direct image URLs",
-    audio: "Extracts high-quality MP3 audio from videos or downloads direct audio files",
-    document: "Downloads direct files of any type (PDF, ZIP, DOCX, DMG, EXE, APK, CSV, JSON, etc.)",
-    webpage: "Inspect extracts all images, videos & files on the page; Download Now saves the HTML page",
-};
 const statusBanner = document.getElementById("statusBanner");
 const previewCard = document.getElementById("previewCard");
 const engineStatus = document.getElementById("engineStatus");
@@ -37,6 +22,37 @@ const downloadsDirLabel = document.getElementById("downloadsDirLabel");
 const refreshFilesBtn = document.getElementById("refreshFilesBtn");
 
 const jobsMap = new Map();
+let selectedContentType = "auto";
+let localBrowserCookiesAllowed = false;
+
+function getApiBase() {
+    if (typeof window.API_BASE_URL === "string" && window.API_BASE_URL.trim()) {
+        return window.API_BASE_URL.trim().replace(/\/+$/, "");
+    }
+    const meta = document.querySelector('meta[name="api-base-url"]');
+    const content = meta?.getAttribute("content") || "";
+    return content.trim().replace(/\/+$/, "");
+}
+
+function apiUrl(endpointPath) {
+    return `${getApiBase()}${endpointPath}`;
+}
+
+function apiFetch(endpointPath, options = {}) {
+    return fetch(apiUrl(endpointPath), {
+        credentials: "include",
+        ...options,
+    });
+}
+
+const CONTENT_TYPE_HINTS = {
+    auto: "Automatically detects video, image, audio, or direct file",
+    video: "Downloads video in 4K / 1080p+ from YouTube, Instagram, X, TikTok, or direct MP4/MKV",
+    image: "Downloads original-resolution images & carousels from Instagram, X, Pinterest, Reddit, or direct image URLs",
+    audio: "Extracts high-quality MP3 audio from videos or downloads direct audio files",
+    document: "Downloads direct files of any type (PDF, ZIP, DOCX, DMG, EXE, APK, CSV, JSON, etc.)",
+    webpage: "Inspect extracts all images, videos & files on the page; Download Now saves the HTML page",
+};
 
 function escapeHtml(str) {
     return String(str ?? "")
@@ -65,22 +81,8 @@ function formatDuration(seconds) {
     return `${mins}:${String(secs).padStart(2, "0")}`;
 }
 
-function showBanner(message, type = "info", { showCookieAction = false } = {}) {
-    statusBanner.innerHTML = "";
-    const msgSpan = document.createElement("span");
-    msgSpan.textContent = message;
-    statusBanner.appendChild(msgSpan);
-
-    if (showCookieAction) {
-        const btn = document.createElement("button");
-        btn.type = "button";
-        btn.className = "btn btn-secondary btn-sm";
-        btn.style.marginLeft = "10px";
-        btn.textContent = "Load cookies.txt";
-        btn.addEventListener("click", openCookiesPanel);
-        statusBanner.appendChild(btn);
-    }
-
+function showBanner(message, type = "info") {
+    statusBanner.textContent = message;
     statusBanner.className = `status-banner ${type}`;
     statusBanner.classList.remove("hidden");
 }
@@ -91,9 +93,22 @@ function hideBanner() {
 
 async function loadHealth() {
     try {
-        const res = await fetch("/api/health");
+        const res = await apiFetch("/api/health");
         const data = await res.json();
-        downloadsDirLabel.textContent = `Folder: ${data.downloadsDir}`;
+
+        localBrowserCookiesAllowed = Boolean(data.mode?.localBrowserCookiesAllowed);
+        cookiesGroup.classList.toggle("hidden", !localBrowserCookiesAllowed);
+        if (!localBrowserCookiesAllowed) {
+            cookiesSelect.value = "";
+        }
+
+        const ttlMins = data.limits?.fileTtlMs ? Math.round(data.limits.fileTtlMs / 60000) : 60;
+        const maxMb = data.limits?.maxDownloadBytes
+            ? Math.round(data.limits.maxDownloadBytes / (1024 * 1024))
+            : 500;
+        downloadsDirLabel.textContent = data.downloadsDir
+            ? `Folder: ${data.downloadsDir} · Auto-cleanup: ${ttlMins}m · Max file: ${maxMb} MB`
+            : `Isolated guest storage · Files auto-expire after ${ttlMins} min · Max file: ${maxMb} MB`;
 
         const ytdlpPill = data.binaries.ytdlp.available
             ? `<span class="pill pill-ok">yt-dlp ready</span>`
@@ -104,27 +119,14 @@ async function loadHealth() {
         const galleryPill = data.binaries.galleryDl?.available
             ? `<span class="pill pill-ok">gallery-dl ready (images)</span>`
             : `<span class="pill pill-warn">gallery-dl missing</span>`;
-        const cookiePill = data.binaries.serverCookies?.available
-            ? `<span class="pill pill-ok">server cookies ready</span>`
-            : "";
+        const modePill = data.mode?.publicHosted
+            ? `<span class="pill pill-muted">Public guest mode</span>`
+            : `<span class="pill pill-muted">Local dev mode</span>`;
 
-        engineStatus.innerHTML = `${ytdlpPill}${ffmpegPill}${galleryPill}${cookiePill}`;
+        engineStatus.innerHTML = `${ytdlpPill}${ffmpegPill}${galleryPill}${modePill}`;
     } catch {
         engineStatus.innerHTML = `<span class="pill pill-warn">Server status unavailable</span>`;
     }
-}
-
-function getCookiePayload() {
-    if (cookiesSelect.value === "cookies_txt") {
-        return {
-            cookiesBrowser: "",
-            cookiesTxt: cookiesTxtArea.value.trim(),
-        };
-    }
-    return {
-        cookiesBrowser: cookiesSelect.value,
-        cookiesTxt: "",
-    };
 }
 
 async function inspectCurrentUrl() {
@@ -140,14 +142,14 @@ async function inspectCurrentUrl() {
     previewCard.classList.add("hidden");
 
     try {
-        const { cookiesBrowser, cookiesTxt } = getCookiePayload();
-        const res = await fetch("/api/analyze", {
+        const res = await apiFetch("/api/analyze", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
                 url,
-                cookiesBrowser,
-                cookiesTxt,
+                ...(localBrowserCookiesAllowed && cookiesSelect.value
+                    ? { cookiesBrowser: cookiesSelect.value }
+                    : {}),
                 contentType: selectedContentType,
             }),
         });
@@ -157,8 +159,7 @@ async function inspectCurrentUrl() {
         }
         renderPreview(data);
     } catch (err) {
-        const needsCookies = /cookies|sign in|bot|login/i.test(err.message);
-        showBanner(err.message, "error", { showCookieAction: needsCookies });
+        showBanner(err.message, "error");
     } finally {
         analyzeBtn.disabled = false;
         analyzeBtn.textContent = "Inspect Link";
@@ -269,7 +270,6 @@ function renderPreview(info) {
         return;
     }
 
-    // Media preview (YouTube, Instagram, X/Twitter, etc.)
     const duration = formatDuration(info.duration);
     const qualitySummary = info.has4K
         ? `<span class="pill pill-ok">4K Available (${info.maxHeight}p)</span>`
@@ -338,16 +338,16 @@ async function startDownload(overrideUrl, overrideQuality, forceDirect = false) 
     downloadBtn.disabled = true;
 
     try {
-        const { cookiesBrowser, cookiesTxt } = getCookiePayload();
-        const res = await fetch("/api/downloads", {
+        const res = await apiFetch("/api/downloads", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
                 url,
                 quality: overrideQuality || qualitySelect.value,
                 container: containerSelect.value,
-                cookiesBrowser,
-                cookiesTxt,
+                ...(localBrowserCookiesAllowed && cookiesSelect.value
+                    ? { cookiesBrowser: cookiesSelect.value }
+                    : {}),
                 customFilename: filenameInput.value.trim(),
                 forceDirect,
                 contentType: forceDirect ? "auto" : selectedContentType,
@@ -360,15 +360,14 @@ async function startDownload(overrideUrl, overrideQuality, forceDirect = false) 
         jobsMap.set(data.id, data);
         renderJobs();
     } catch (err) {
-        const needsCookies = /cookies|sign in|bot|login/i.test(err.message);
-        showBanner(err.message, "error", { showCookieAction: needsCookies });
+        showBanner(err.message, "error");
     } finally {
         downloadBtn.disabled = false;
     }
 }
 
 async function cancelJob(id) {
-    await fetch(`/api/downloads/${encodeURIComponent(id)}/cancel`, { method: "POST" });
+    await apiFetch(`/api/downloads/${encodeURIComponent(id)}/cancel`, { method: "POST" });
 }
 
 function renderJobs() {
@@ -397,13 +396,17 @@ function renderJobs() {
             if (job.eta && job.status === "downloading") statsParts.push(`ETA ${job.eta}`);
 
             const active =
-                job.status === "analyzing" || job.status === "downloading" || job.status === "merging";
+                job.status === "queued" ||
+                job.status === "analyzing" ||
+                job.status === "downloading" ||
+                job.status === "merging";
 
-            const savedFiles = Array.isArray(job.files) && job.files.length > 0
-                ? job.files
-                : job.filename
-                    ? [job.filename]
-                    : [];
+            const savedFiles =
+                Array.isArray(job.files) && job.files.length > 0
+                    ? job.files
+                    : job.filename
+                        ? [job.filename]
+                        : [];
 
             return `
                 <div class="job-item">
@@ -420,7 +423,7 @@ function renderJobs() {
                             }
                             ${
                                 job.status === "completed" && savedFiles.length === 1
-                                    ? `<a class="btn btn-primary btn-sm" href="/api/files/${encodeURIComponent(savedFiles[0])}">Save File</a>`
+                                    ? `<a class="btn btn-primary btn-sm" href="${escapeHtml(apiUrl(`/api/files/${encodeURIComponent(savedFiles[0])}`))}">Save File</a>`
                                     : job.status === "completed" && savedFiles.length > 1
                                         ? `<span class="pill pill-ok">${savedFiles.length} files saved below</span>`
                                         : ""
@@ -442,7 +445,7 @@ function renderJobs() {
 
 async function loadFiles() {
     try {
-        const res = await fetch("/api/files");
+        const res = await apiFetch("/api/files");
         const data = await res.json();
         const files = data.files || [];
 
@@ -454,19 +457,20 @@ async function loadFiles() {
         filesList.innerHTML = files
             .map((file) => {
                 const isImg = (file.mimeType || "").startsWith("image/");
-                const inlineUrl = `/api/files/${encodeURIComponent(file.name)}?inline=1`;
+                const downloadUrl = apiUrl(`/api/files/${encodeURIComponent(file.name)}`);
+                const inlineUrl = apiUrl(`/api/files/${encodeURIComponent(file.name)}?inline=1`);
                 return `
                 <div class="file-item">
                     <div class="file-left">
-                        ${isImg ? `<img class="file-thumb" src="${inlineUrl}" alt="" loading="lazy" />` : ""}
+                        ${isImg ? `<img class="file-thumb" src="${escapeHtml(inlineUrl)}" alt="" loading="lazy" />` : ""}
                         <div>
                             <div class="file-name">${escapeHtml(file.name)}</div>
                             <div class="file-meta">${formatBytes(file.size)} · ${escapeHtml(file.mimeType)}</div>
                         </div>
                     </div>
                     <div class="file-actions">
-                        <a class="btn btn-secondary btn-sm" href="${inlineUrl}" target="_blank" rel="noopener">Preview</a>
-                        <a class="btn btn-primary btn-sm" href="/api/files/${encodeURIComponent(file.name)}">Download</a>
+                        <a class="btn btn-secondary btn-sm" href="${escapeHtml(inlineUrl)}" target="_blank" rel="noopener">Preview</a>
+                        <a class="btn btn-primary btn-sm" href="${escapeHtml(downloadUrl)}">Download</a>
                         <button type="button" class="btn btn-danger btn-sm" data-delete-file="${escapeHtml(file.name)}">Delete</button>
                     </div>
                 </div>
@@ -477,7 +481,7 @@ async function loadFiles() {
         filesList.querySelectorAll("[data-delete-file]").forEach((btn) => {
             btn.addEventListener("click", async () => {
                 const name = btn.getAttribute("data-delete-file");
-                await fetch(`/api/files/${encodeURIComponent(name)}`, { method: "DELETE" });
+                await apiFetch(`/api/files/${encodeURIComponent(name)}`, { method: "DELETE" });
                 loadFiles();
             });
         });
@@ -487,7 +491,7 @@ async function loadFiles() {
 }
 
 function connectEvents() {
-    const evtSource = new EventSource("/api/events");
+    const evtSource = new EventSource(apiUrl("/api/events"), { withCredentials: true });
     evtSource.addEventListener("init", (event) => {
         const payload = JSON.parse(event.data);
         jobsMap.clear();
@@ -544,67 +548,6 @@ contentTypePills.querySelectorAll("[data-content-type]").forEach((btn) => {
     });
 });
 
-const COOKIES_STORAGE_KEY = "ud_cookies_txt";
-
-function updateCookiesStatusBadge() {
-    const lines = cookiesTxtArea.value
-        .split(/\r?\n/)
-        .map((l) => l.trim())
-        .filter((l) => l && !l.startsWith("#"));
-    if (lines.length > 0) {
-        cookiesStatusBadge.textContent = `Loaded (${lines.length} entries)`;
-        cookiesStatusBadge.className = "pill pill-ok";
-    } else {
-        cookiesStatusBadge.textContent = "Not loaded";
-        cookiesStatusBadge.className = "pill pill-muted";
-    }
-}
-
-function openCookiesPanel() {
-    cookiesSelect.value = "cookies_txt";
-    cookiesTxtPanel.classList.remove("hidden");
-    cookiesTxtPanel.scrollIntoView({ behavior: "smooth", block: "nearest" });
-    updateCookiesStatusBadge();
-}
-
-const savedCookiesTxt = sessionStorage.getItem(COOKIES_STORAGE_KEY) || "";
-if (savedCookiesTxt) {
-    cookiesTxtArea.value = savedCookiesTxt;
-    cookiesSelect.value = "cookies_txt";
-    cookiesTxtPanel.classList.remove("hidden");
-}
-updateCookiesStatusBadge();
-
-cookiesSelect.addEventListener("change", () => {
-    const showTxt = cookiesSelect.value === "cookies_txt";
-    cookiesTxtPanel.classList.toggle("hidden", !showTxt);
-    updateCookiesStatusBadge();
-});
-
-cookiesTxtArea.addEventListener("input", () => {
-    sessionStorage.setItem(COOKIES_STORAGE_KEY, cookiesTxtArea.value);
-    updateCookiesStatusBadge();
-});
-
-cookiesFileInput.addEventListener("change", async (e) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    const text = await file.text();
-    cookiesTxtArea.value = text;
-    sessionStorage.setItem(COOKIES_STORAGE_KEY, text);
-    cookiesSelect.value = "cookies_txt";
-    cookiesTxtPanel.classList.remove("hidden");
-    updateCookiesStatusBadge();
-    showBanner(`Loaded cookies file "${file.name}" for this browser session.`, "info");
-});
-
-clearCookiesBtn.addEventListener("click", () => {
-    cookiesTxtArea.value = "";
-    cookiesFileInput.value = "";
-    sessionStorage.removeItem(COOKIES_STORAGE_KEY);
-    updateCookiesStatusBadge();
-});
-
 pasteBtn.addEventListener("click", async () => {
     try {
         const text = await navigator.clipboard.readText();
@@ -622,6 +565,7 @@ downloadForm.addEventListener("submit", (e) => {
     startDownload();
 });
 
-loadHealth();
-loadFiles();
-connectEvents();
+loadHealth().then(() => {
+    loadFiles();
+    connectEvents();
+});

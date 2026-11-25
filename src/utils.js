@@ -1,9 +1,9 @@
 const fs = require("fs");
 const path = require("path");
+const config = require("./config");
+const { validatePublicHttpUrl } = require("./ssrf");
 
-const DOWNLOADS_DIR = process.env.DOWNLOADS_DIR
-    ? path.resolve(process.env.DOWNLOADS_DIR)
-    : path.resolve(__dirname, "..", "downloads");
+const DOWNLOADS_DIR = config.BASE_DOWNLOADS_DIR;
 
 function ensureDirSync(dirPath) {
     if (!fs.existsSync(dirPath)) {
@@ -11,20 +11,8 @@ function ensureDirSync(dirPath) {
     }
 }
 
-function validateHttpUrl(rawUrl) {
-    if (typeof rawUrl !== "string" || !rawUrl.trim()) {
-        throw new Error("Please provide a URL.");
-    }
-    let parsed;
-    try {
-        parsed = new URL(rawUrl.trim());
-    } catch {
-        throw new Error("Invalid URL format. Include http:// or https://.");
-    }
-    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-        throw new Error("Only http:// and https:// URLs are supported.");
-    }
-    return parsed.toString();
+function validateHttpUrl(rawUrl, options = {}) {
+    return validatePublicHttpUrl(rawUrl, options);
 }
 
 function sanitizeFilename(name, fallback = "download") {

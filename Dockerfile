@@ -20,9 +20,10 @@ COPY server.js ./
 COPY src ./src
 COPY public ./public
 
-RUN mkdir -p /app/downloads
+RUN mkdir -p /app/downloads/guests
 
 ENV NODE_ENV=production
+ENV PUBLIC_HOSTED_MODE=true
 ENV PORT=10000
 
 EXPOSE 10000

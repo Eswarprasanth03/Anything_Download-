@@ -3,9 +3,15 @@ const fs = require("fs");
 const http = require("http");
 const path = require("path");
 const { execFileSync } = require("child_process");
+
+process.env.NODE_ENV = "test";
+process.env.ALLOW_TEST_LOCALHOST = "1";
+process.env.PUBLIC_HOSTED_MODE = "false";
+
 const app = require("../server");
 const jobManager = require("../src/jobManager");
-const { withCookieFile } = require("../src/analyzer");
+const storage = require("../src/storage");
+const { verifySignedGuestToken } = require("../src/guestSession");
 const { resolveFfmpegPath } = require("../src/binaries");
 const { DOWNLOADS_DIR } = require("../src/utils");
 
@@ -18,10 +24,12 @@ function startServer(serverApp) {
     });
 }
 
-async function waitForJob(baseUrl, jobId) {
+async function waitForJob(baseUrl, cookie, jobId) {
     for (let i = 0; i < 200; i++) {
         await new Promise((r) => setTimeout(r, 100));
-        const listRes = await fetch(`${baseUrl}/api/downloads`);
+        const listRes = await fetch(`${baseUrl}/api/downloads`, {
+            headers: { Cookie: cookie },
+        });
         const { jobs } = await listRes.json();
         const found = jobs.find((j) => j.id === jobId);
         if (found && found.status === "completed") return found;
@@ -34,13 +42,11 @@ async function waitForJob(baseUrl, jobId) {
 
 async function run() {
     const sampleArchive = Buffer.from("UNIVERSAL-DOWNLOADER-BINARY-PAYLOAD-1234567890");
-    // Minimal valid 1x1 PNG bytes
     const sampleImage = Buffer.from(
         "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000a49444154789c63000100000500010d0a2db40000000049454e44ae426082",
         "hex"
     );
 
-    // Generate a tiny 1-second valid MP4 with silent audio using bundled ffmpeg-static
     const ffmpegPath = resolveFfmpegPath();
     const tmpMp4Path = path.join(DOWNLOADS_DIR, ".fixture_clip.mp4");
     execFileSync(ffmpegPath, [
@@ -120,30 +126,29 @@ async function run() {
     const fixture = await startServer(mockFixture);
     const api = await startServer(app);
     const createdFiles = [];
+    let guestCookie = null;
+    let guestId = null;
 
     try {
-        // 1. Health endpoint
+        // 1. Health endpoint & guest session initialization
         const healthRes = await fetch(`${api.baseUrl}/api/health`);
         assert.strictEqual(healthRes.status, 200);
+        guestCookie = healthRes.headers.get("set-cookie").split(";")[0];
+        guestId = verifySignedGuestToken(decodeURIComponent(guestCookie.split("=")[1])).guestId;
+
         const health = await healthRes.json();
         assert.strictEqual(health.ok, true);
         assert.strictEqual(health.binaries.ytdlp.available, true);
         assert.strictEqual(health.binaries.ffmpeg.available, true);
         assert.strictEqual(health.binaries.galleryDl.available, true);
-        assert.strictEqual(typeof health.binaries.serverCookies.available, "boolean");
+        assert.strictEqual(health.mode.localBrowserCookiesAllowed, true);
 
-        // 1b. Verify temporary cookies.txt creation and cleanup
-        let seenCookiePath = null;
-        await withCookieFile("# Netscape HTTP Cookie File\n", async (tmpPath) => {
-            seenCookiePath = tmpPath;
-            assert.ok(tmpPath && fs.existsSync(tmpPath));
-        });
-        assert.strictEqual(fs.existsSync(seenCookiePath), false);
+        const guestDir = storage.getGuestDir(guestId);
 
         // 2. Analyze direct archive file
         const analyzeDirectRes = await fetch(`${api.baseUrl}/api/analyze`, {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: { "Content-Type": "application/json", Cookie: guestCookie },
             body: JSON.stringify({ url: `${fixture.baseUrl}/sample-archive.zip` }),
         });
         assert.strictEqual(analyzeDirectRes.status, 200);
@@ -154,7 +159,7 @@ async function run() {
         // 3. Analyze extensionless CDN image URL
         const analyzeImgRes = await fetch(`${api.baseUrl}/api/analyze`, {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: { "Content-Type": "application/json", Cookie: guestCookie },
             body: JSON.stringify({ url: `${fixture.baseUrl}/cdn/photo?id=42` }),
         });
         assert.strictEqual(analyzeImgRes.status, 200);
@@ -167,7 +172,7 @@ async function run() {
         // 4. Analyze webpage with og:image, srcset, extensionless <img>, and PDF
         const analyzePageRes = await fetch(`${api.baseUrl}/api/analyze`, {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: { "Content-Type": "application/json", Cookie: guestCookie },
             body: JSON.stringify({ url: `${fixture.baseUrl}/page-assets.html` }),
         });
         assert.strictEqual(analyzePageRes.status, 200);
@@ -179,10 +184,10 @@ async function run() {
         assert.ok(pageInfo.assets.some((a) => a.url.includes("/avatar?size=full")));
         assert.ok(pageInfo.assets.some((a) => a.url.includes("/guide.pdf")));
 
-        // 5. Analyze webpage with HTML5 video (auto -> media, webpage -> webpage)
+        // 5. Analyze webpage with HTML5 video
         const analyzeVideoPageRes = await fetch(`${api.baseUrl}/api/analyze`, {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: { "Content-Type": "application/json", Cookie: guestCookie },
             body: JSON.stringify({ url: `${fixture.baseUrl}/page-video.html` }),
         });
         assert.strictEqual(analyzeVideoPageRes.status, 200);
@@ -192,7 +197,7 @@ async function run() {
         // 5b. Explicit contentType filtering ("image", "document", "webpage")
         const analyzeImageModeRes = await fetch(`${api.baseUrl}/api/analyze`, {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: { "Content-Type": "application/json", Cookie: guestCookie },
             body: JSON.stringify({
                 url: `${fixture.baseUrl}/page-assets.html`,
                 contentType: "image",
@@ -205,7 +210,7 @@ async function run() {
 
         const analyzeDocModeRes = await fetch(`${api.baseUrl}/api/analyze`, {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: { "Content-Type": "application/json", Cookie: guestCookie },
             body: JSON.stringify({
                 url: `${fixture.baseUrl}/page-assets.html`,
                 contentType: "document",
@@ -218,7 +223,7 @@ async function run() {
 
         const analyzeWebpageModeRes = await fetch(`${api.baseUrl}/api/analyze`, {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: { "Content-Type": "application/json", Cookie: guestCookie },
             body: JSON.stringify({
                 url: `${fixture.baseUrl}/page-video.html`,
                 contentType: "webpage",
@@ -232,33 +237,27 @@ async function run() {
         // 6. Download direct ZIP file
         const dlZipRes = await fetch(`${api.baseUrl}/api/downloads`, {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: { "Content-Type": "application/json", Cookie: guestCookie },
             body: JSON.stringify({ url: `${fixture.baseUrl}/sample-archive.zip` }),
         });
         assert.strictEqual(dlZipRes.status, 202);
-        const zipJob = await waitForJob(api.baseUrl, (await dlZipRes.json()).id);
+        const zipJob = await waitForJob(api.baseUrl, guestCookie, (await dlZipRes.json()).id);
         createdFiles.push(zipJob.filename);
-        assert.deepStrictEqual(
-            fs.readFileSync(path.join(DOWNLOADS_DIR, zipJob.filename)),
-            sampleArchive
-        );
+        assert.deepStrictEqual(fs.readFileSync(path.join(guestDir, zipJob.filename)), sampleArchive);
 
         // 7. Download extensionless CDN image
         const dlImgRes = await fetch(`${api.baseUrl}/api/downloads`, {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: { "Content-Type": "application/json", Cookie: guestCookie },
             body: JSON.stringify({ url: `${fixture.baseUrl}/cdn/photo?id=42` }),
         });
         assert.strictEqual(dlImgRes.status, 202);
-        const imgJob = await waitForJob(api.baseUrl, (await dlImgRes.json()).id);
+        const imgJob = await waitForJob(api.baseUrl, guestCookie, (await dlImgRes.json()).id);
         createdFiles.push(imgJob.filename);
         assert.ok(imgJob.filename.endsWith(".png"));
-        assert.deepStrictEqual(
-            fs.readFileSync(path.join(DOWNLOADS_DIR, imgJob.filename)),
-            sampleImage
-        );
+        assert.deepStrictEqual(fs.readFileSync(path.join(guestDir, imgJob.filename)), sampleImage);
 
-        // 7b. Verify every Target Quality dropdown option selector + real yt-dlp/ffmpeg MP4 & MP3 downloads
+        // 7b. Verify Target Quality dropdown selectors + real yt-dlp/ffmpeg MP4 & MP3 downloads
         const expectedSort = {
             "4k": "res:2160,ext:mp4:m4a",
             max: "ext:mp4:m4a",
@@ -275,10 +274,9 @@ async function run() {
         assert.strictEqual(audioSel.format, "bestaudio/best");
         assert.deepStrictEqual(audioSel.extraArgs, ["-x", "--audio-format", "mp3", "--audio-quality", "0"]);
 
-        // Test downloading same page-video.html twice at different qualities (1080p then 720p) without collision/skip
         const dl1080Res = await fetch(`${api.baseUrl}/api/downloads`, {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: { "Content-Type": "application/json", Cookie: guestCookie },
             body: JSON.stringify({
                 url: `${fixture.baseUrl}/page-video.html`,
                 contentType: "video",
@@ -287,13 +285,13 @@ async function run() {
             }),
         });
         assert.strictEqual(dl1080Res.status, 202);
-        const job1080 = await waitForJob(api.baseUrl, (await dl1080Res.json()).id);
+        const job1080 = await waitForJob(api.baseUrl, guestCookie, (await dl1080Res.json()).id);
         createdFiles.push(job1080.filename);
         assert.ok(job1080.filename.includes("[1080p]"));
 
         const dl720Res = await fetch(`${api.baseUrl}/api/downloads`, {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: { "Content-Type": "application/json", Cookie: guestCookie },
             body: JSON.stringify({
                 url: `${fixture.baseUrl}/page-video.html`,
                 contentType: "video",
@@ -302,15 +300,14 @@ async function run() {
             }),
         });
         assert.strictEqual(dl720Res.status, 202);
-        const job720 = await waitForJob(api.baseUrl, (await dl720Res.json()).id);
+        const job720 = await waitForJob(api.baseUrl, guestCookie, (await dl720Res.json()).id);
         createdFiles.push(job720.filename);
         assert.ok(job720.filename.includes("[720p]"));
         assert.notStrictEqual(job1080.filename, job720.filename);
 
-        // Test Audio Only (MP3) option end-to-end with yt-dlp + ffmpeg
         const dlAudioRes = await fetch(`${api.baseUrl}/api/downloads`, {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: { "Content-Type": "application/json", Cookie: guestCookie },
             body: JSON.stringify({
                 url: `${fixture.baseUrl}/page-video.html`,
                 contentType: "auto",
@@ -318,30 +315,31 @@ async function run() {
             }),
         });
         assert.strictEqual(dlAudioRes.status, 202);
-        const jobAudio = await waitForJob(api.baseUrl, (await dlAudioRes.json()).id);
+        const jobAudio = await waitForJob(api.baseUrl, guestCookie, (await dlAudioRes.json()).id);
         createdFiles.push(jobAudio.filename);
         assert.ok(jobAudio.filename.endsWith(".mp3"));
 
         // 8. File listing & deletion
-        const filesRes = await fetch(`${api.baseUrl}/api/files`);
+        const filesRes = await fetch(`${api.baseUrl}/api/files`, {
+            headers: { Cookie: guestCookie },
+        });
         const { files } = await filesRes.json();
         for (const name of createdFiles) {
             assert.ok(files.some((f) => f.name === name));
             const delRes = await fetch(
                 `${api.baseUrl}/api/files/${encodeURIComponent(name)}`,
-                { method: "DELETE" }
+                { method: "DELETE", headers: { Cookie: guestCookie } }
             );
             assert.strictEqual(delRes.status, 200);
-            assert.strictEqual(fs.existsSync(path.join(DOWNLOADS_DIR, name)), false);
+            assert.strictEqual(fs.existsSync(path.join(guestDir, name)), false);
         }
         createdFiles.length = 0;
 
         console.log("ALL LOCAL API, IMAGE, WEBPAGE & FILE DOWNLOAD TESTS PASSED");
     } finally {
         if (fs.existsSync(tmpMp4Path)) fs.unlinkSync(tmpMp4Path);
-        for (const name of createdFiles) {
-            const p = path.join(DOWNLOADS_DIR, name);
-            if (fs.existsSync(p)) fs.unlinkSync(p);
+        if (guestId) {
+            fs.rmSync(storage.getGuestDir(guestId), { recursive: true, force: true });
         }
         fixture.server.close();
         api.server.close();

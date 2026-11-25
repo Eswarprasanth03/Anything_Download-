@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Universal Link &amp; 4K Media Downloader</title>
+    <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+    <div class="app-shell">
+        <header class="topbar">
+            <div class="brand">
+                <div class="brand-icon">↓</div>
+                <div>
+                    <h1>Universal Downloader</h1>
+                    <p class="subtitle">Download images, documents, archives, audio &amp; 4K / 1080p video from any link</p>
+                </div>
+            </div>
+            <div class="engine-status" id="engineStatus">
+                <span class="pill pill-muted">Checking engines...</span>
+            </div>
+        </header>
+
+        <main class="main-grid">
+            <section class="card input-card">
+                <form id="downloadForm" class="url-form">
+                    <label for="urlInput" class="sr-only">Link URL</label>
+                    <div class="url-row">
+                        <input
+                            id="urlInput"
+                            type="url"
+                            placeholder="Paste any URL (YouTube, Instagram, X/Twitter, PDF, ZIP, MP4, image...)"
+                            autocomplete="off"
+                            required
+                        />
+                        <button type="button" id="pasteBtn" class="btn btn-ghost" title="Paste from clipboard">Paste</button>
+                        <button type="button" id="analyzeBtn" class="btn btn-secondary">Inspect Link</button>
+                        <button type="submit" id="downloadBtn" class="btn btn-primary">Download Now</button>
+                    </div>
+
+                    <div class="content-type-bar">
+                        <div class="content-type-header">
+                            <span class="content-type-label">Content Type in Link</span>
+                            <span id="contentTypeHint" class="content-type-hint">Automatically detects video, image, audio, or direct file</span>
+                        </div>
+                        <div class="content-type-pills" id="contentTypePills" role="radiogroup" aria-label="Content Type">
+                            <button type="button" class="type-pill active" data-content-type="auto">Auto-Detect</button>
+                            <button type="button" class="type-pill" data-content-type="video">Video (4K / 1080p)</button>
+                            <button type="button" class="type-pill" data-content-type="image">Image / Photo</button>
+                            <button type="button" class="type-pill" data-content-type="audio">Audio (MP3)</button>
+                            <button type="button" class="type-pill" data-content-type="document">Document / File</button>
+                            <button type="button" class="type-pill" data-content-type="webpage">Webpage (HTML / Assets)</button>
+                        </div>
+                    </div>
+
+                    <div class="options-row">
+                        <div class="option-group" id="qualityGroup">
+                            <label for="qualitySelect">Target Quality</label>
+                            <select id="qualitySelect">
+                                <option value="4k" selected>4K Ultra HD (up to 2160p)</option>
+                                <option value="max">Max Available (4K / 8K)</option>
+                                <option value="1440p">2K QHD (1440p)</option>
+                                <option value="1080p">Full HD (1080p)</option>
+                                <option value="720p">HD (720p)</option>
+                                <option value="audio">Audio Only (MP3)</option>
+                            </select>
+                        </div>
+
+                        <div class="option-group" id="containerGroup">
+                            <label for="containerSelect">Video Format</label>
+                            <select id="containerSelect">
+                                <option value="mp4" selected>MP4 (Universal)</option>
+                                <option value="mkv">MKV (Best codec compatibility)</option>
+                                <option value="webm">WEBM</option>
+                            </select>
+                        </div>
+
+                        <div class="option-group">
+                            <label for="cookiesSelect">Browser Cookies (for private/IG/X)</label>
+                            <select id="cookiesSelect">
+                                <option value="" selected>None (Public links)</option>
+                                <option value="chrome">Google Chrome</option>
+                                <option value="safari">Safari</option>
+                                <option value="firefox">Firefox</option>
+                                <option value="brave">Brave</option>
+                                <option value="edge">Microsoft Edge</option>
+                            </select>
+                        </div>
+
+                        <div class="option-group">
+                            <label for="filenameInput">Custom Filename (optional)</label>
+                            <input id="filenameInput" type="text" placeholder="Auto-detect from link" />
+                        </div>
+                    </div>
+                </form>
+
+                <div id="statusBanner" class="status-banner hidden"></div>
+            </section>
+
+            <section id="previewCard" class="card preview-card hidden"></section>
+
+            <section class="card">
+                <div class="section-header">
+                    <h2>Active &amp; Recent Downloads</h2>
+                    <span class="badge" id="jobCount">0</span>
+                </div>
+                <div id="jobsList" class="jobs-list">
+                    <div class="empty-state">No downloads yet. Paste any link above to begin.</div>
+                </div>
+            </section>
+
+            <section class="card">
+                <div class="section-header">
+                    <div>
+                        <h2>Saved Files</h2>
+                        <p class="section-sub" id="downloadsDirLabel"></p>
+                    </div>
+                    <button type="button" id="refreshFilesBtn" class="btn btn-ghost btn-sm">Refresh</button>
+                </div>
+                <div id="filesList" class="files-list">
+                    <div class="empty-state">Your downloaded files will appear here.</div>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <script src="/app.js"></script>
+</body>
+</html>

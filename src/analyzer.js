@@ -1,5 +1,7 @@
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
+const crypto = require("crypto");
 const { execFile } = require("child_process");
 const mime = require("mime-types");
 const { resolveYtDlpPath, resolveGalleryDlPath } = require("./binaries");
@@ -167,7 +169,10 @@ async function probeDirectHttp(urlStr) {
     }
 }
 
-function buildCookieArgs(cookiesBrowser) {
+function buildCookieArgs(cookiesBrowser, tempCookieFilePath = null) {
+    if (tempCookieFilePath && fs.existsSync(tempCookieFilePath)) {
+        return ["--cookies", tempCookieFilePath];
+    }
     const allowed = new Set(["chrome", "safari", "firefox", "edge", "brave", "chromium"]);
     if (cookiesBrowser && allowed.has(cookiesBrowser.toLowerCase())) {
         return ["--cookies-from-browser", cookiesBrowser.toLowerCase()];
@@ -179,18 +184,69 @@ function buildCookieArgs(cookiesBrowser) {
     return [];
 }
 
-function runYtDlpJson(urlStr, { cookiesBrowser } = {}) {
+async function withCookieFile(cookiesTxt, fn) {
+    if (!cookiesTxt || typeof cookiesTxt !== "string" || !cookiesTxt.trim()) {
+        return fn(null);
+    }
+    if (cookiesTxt.length > 512 * 1024) {
+        throw new Error("cookies.txt file is too large (max 512 KB).");
+    }
+    const tmpPath = path.join(os.tmpdir(), `yt_cookies_${crypto.randomUUID()}.txt`);
+    fs.writeFileSync(tmpPath, cookiesTxt, { mode: 0o600 });
+    try {
+        return await fn(tmpPath);
+    } finally {
+        try {
+            if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
+        } catch {
+            // Ignore cleanup errors
+        }
+    }
+}
+
+function getYtDlpBaseArgs() {
+    return ["--js-runtimes", `node:${process.execPath}`];
+}
+
+async function resolveShareRedirect(urlStr) {
+    try {
+        const parsed = new URL(urlStr);
+        if (/reddit\.com$/i.test(parsed.hostname) && /\/s\//.test(parsed.pathname)) {
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), 8000);
+            try {
+                const res = await fetch(urlStr, {
+                    method: "HEAD",
+                    redirect: "follow",
+                    headers: DEFAULT_HEADERS,
+                    signal: controller.signal,
+                });
+                if (res.url && !/\/s\//.test(new URL(res.url).pathname)) {
+                    return res.url;
+                }
+            } finally {
+                clearTimeout(timer);
+            }
+        }
+    } catch {
+        // Keep original URL on failure
+    }
+    return urlStr;
+}
+
+function runYtDlpJson(urlStr, { cookiesBrowser, tempCookieFilePath } = {}) {
     const ytdlpPath = resolveYtDlpPath();
     if (!ytdlpPath) {
         return Promise.reject(new Error("yt-dlp binary is not installed."));
     }
 
     const args = [
+        ...getYtDlpBaseArgs(),
         "--dump-single-json",
         "--no-warnings",
         "--no-playlist",
         "--skip-download",
-        ...buildCookieArgs(cookiesBrowser),
+        ...buildCookieArgs(cookiesBrowser, tempCookieFilePath),
         urlStr,
     ];
 
@@ -215,7 +271,7 @@ function runYtDlpJson(urlStr, { cookiesBrowser } = {}) {
     });
 }
 
-function runGalleryDlJson(urlStr, { cookiesBrowser } = {}) {
+function runGalleryDlJson(urlStr, { cookiesBrowser, tempCookieFilePath } = {}) {
     const galleryDlPath = resolveGalleryDlPath();
     if (!galleryDlPath) {
         return Promise.reject(new Error("gallery-dl is not installed."));
@@ -225,7 +281,7 @@ function runGalleryDlJson(urlStr, { cookiesBrowser } = {}) {
         "--dump-json",
         "--range",
         "1-30",
-        ...buildCookieArgs(cookiesBrowser),
+        ...buildCookieArgs(cookiesBrowser, tempCookieFilePath),
         urlStr,
     ];
 
@@ -492,83 +548,190 @@ function normalizeContentType(value) {
 }
 
 async function analyzeUrl(rawUrl, options = {}) {
-    const urlStr = validateHttpUrl(rawUrl);
+    const initialUrl = validateHttpUrl(rawUrl);
+    const urlStr = await resolveShareRedirect(initialUrl);
     const contentType = normalizeContentType(options.contentType);
 
-    // Explicit "webpage" mode: extract all images, videos, and downloadable files from HTML
-    if (contentType === "webpage") {
-        const { title: pageTitle, assets } = await extractWebpageAssets(urlStr);
-        return {
-            kind: "webpage",
-            url: urlStr,
-            title: pageTitle || new URL(urlStr).hostname,
-            platform: new URL(urlStr).hostname.replace(/^www\./, ""),
-            assets,
-            allowHtmlSave: true,
-            note:
-                assets.length > 0
-                    ? "Extracted downloadable images, media, and files from this webpage."
-                    : "No embedded assets found; you can save the webpage HTML directly.",
-        };
-    }
+    return withCookieFile(options.cookiesTxt, async (tempCookieFilePath) => {
+        const execOpts = { ...options, tempCookieFilePath };
 
-    // Explicit "document" mode: probe direct HTTP file first, else scan page for downloadable files
-    if (contentType === "document") {
-        const probe = await probeDirectHttp(urlStr);
-        if (probe && probe.isDirectFile) {
+        // Explicit "webpage" mode: extract all images, videos, and downloadable files from HTML
+        if (contentType === "webpage") {
+            const { title: pageTitle, assets } = await extractWebpageAssets(urlStr);
             return {
-                kind: "direct",
-                url: probe.finalUrl,
-                originalUrl: urlStr,
-                filename: probe.filename,
-                mimeType: probe.mimeType,
-                category: probe.category,
-                fileSize: probe.fileSize,
-                title: probe.filename,
-                platform: new URL(probe.finalUrl).hostname.replace(/^www\./, ""),
+                kind: "webpage",
+                url: urlStr,
+                title: pageTitle || new URL(urlStr).hostname,
+                platform: new URL(urlStr).hostname.replace(/^www\./, ""),
+                assets,
+                allowHtmlSave: true,
+                note:
+                    assets.length > 0
+                        ? "Extracted downloadable images, media, and files from this webpage."
+                        : "No embedded assets found; you can save the webpage HTML directly.",
             };
         }
 
-        const { title: pageTitle, assets } = await extractWebpageAssets(urlStr);
-        const docAssets = assets.filter((a) => a.category === "file" || a.category === "audio");
-        return {
-            kind: "webpage",
-            url: urlStr,
-            title: pageTitle || new URL(urlStr).hostname,
-            platform: new URL(urlStr).hostname.replace(/^www\./, ""),
-            assets: docAssets.length > 0 ? docAssets : assets,
-            allowHtmlSave: true,
-            note:
-                docAssets.length > 0
-                    ? "Link returned a webpage; detected downloadable documents & files on the page."
-                    : "Link returned a webpage rather than a direct file. Pick an asset below or save the HTML.",
-        };
-    }
+        // Explicit "document" mode: probe direct HTTP file first, else scan page for downloadable files
+        if (contentType === "document") {
+            const probe = await probeDirectHttp(urlStr);
+            if (probe && probe.isDirectFile) {
+                return {
+                    kind: "direct",
+                    url: probe.finalUrl,
+                    originalUrl: urlStr,
+                    filename: probe.filename,
+                    mimeType: probe.mimeType,
+                    category: probe.category,
+                    fileSize: probe.fileSize,
+                    title: probe.filename,
+                    platform: new URL(probe.finalUrl).hostname.replace(/^www\./, ""),
+                };
+            }
 
-    // Explicit "image" mode: check direct image -> gallery-dl (IG/X/Reddit/Pinterest) -> webpage images
-    if (contentType === "image") {
-        const probe = await probeDirectHttp(urlStr);
-        if (probe && probe.isDirectFile) {
+            const { title: pageTitle, assets } = await extractWebpageAssets(urlStr);
+            const docAssets = assets.filter((a) => a.category === "file" || a.category === "audio");
             return {
-                kind: "direct",
-                url: probe.finalUrl,
-                originalUrl: urlStr,
-                filename: probe.filename,
-                mimeType: probe.mimeType,
-                category: probe.category,
-                fileSize: probe.fileSize,
-                title: probe.filename,
-                platform: new URL(probe.finalUrl).hostname.replace(/^www\./, ""),
+                kind: "webpage",
+                url: urlStr,
+                title: pageTitle || new URL(urlStr).hostname,
+                platform: new URL(urlStr).hostname.replace(/^www\./, ""),
+                assets: docAssets.length > 0 ? docAssets : assets,
+                allowHtmlSave: true,
+                note:
+                    docAssets.length > 0
+                        ? "Link returned a webpage; detected downloadable documents & files on the page."
+                        : "Link returned a webpage rather than a direct file. Pick an asset below or save the HTML.",
             };
         }
 
+        // Explicit "image" mode: check direct image -> gallery-dl (IG/X/Reddit/Pinterest) -> webpage images
+        if (contentType === "image") {
+            const probe = await probeDirectHttp(urlStr);
+            if (probe && probe.isDirectFile) {
+                return {
+                    kind: "direct",
+                    url: probe.finalUrl,
+                    originalUrl: urlStr,
+                    filename: probe.filename,
+                    mimeType: probe.mimeType,
+                    category: probe.category,
+                    fileSize: probe.fileSize,
+                    title: probe.filename,
+                    platform: new URL(probe.finalUrl).hostname.replace(/^www\./, ""),
+                };
+            }
+
+            try {
+                const gallery = await runGalleryDlJson(urlStr, execOpts);
+                const title =
+                    gallery.meta.description ||
+                    gallery.meta.title ||
+                    gallery.meta.content ||
+                    `Images from ${new URL(urlStr).hostname.replace(/^www\./, "")}`;
+                return {
+                    kind: "gallery",
+                    url: urlStr,
+                    title: String(title).slice(0, 140),
+                    uploader: gallery.meta.username || gallery.meta.author?.name || gallery.meta.user?.name || null,
+                    platform: gallery.meta.category || new URL(urlStr).hostname.replace(/^www\./, ""),
+                    itemCount: gallery.items.length,
+                    items: gallery.items,
+                };
+            } catch (galErr) {
+                const { title: pageTitle, assets } = await extractWebpageAssets(urlStr);
+                const imgAssets = assets.filter((a) => a.category === "image");
+                if (imgAssets.length > 0) {
+                    return {
+                        kind: "webpage",
+                        url: urlStr,
+                        title: pageTitle || new URL(urlStr).hostname,
+                        platform: new URL(urlStr).hostname.replace(/^www\./, ""),
+                        assets: imgAssets,
+                        allowHtmlSave: false,
+                        note: `Found ${imgAssets.length} image(s) on this page.`,
+                    };
+                }
+                throw new Error(
+                    galErr.message ||
+                        "No downloadable images found at this link. Upload a cookies.txt file if login is required."
+                );
+            }
+        }
+
+        // For auto / audio on non-social hosts, probe HTTP headers first to detect direct files
+        if (contentType !== "video" && !isKnownMediaHost(urlStr)) {
+            const probe = await probeDirectHttp(urlStr);
+            if (probe && probe.isDirectFile) {
+                return {
+                    kind: "direct",
+                    url: probe.finalUrl,
+                    originalUrl: urlStr,
+                    filename: probe.filename,
+                    mimeType: probe.mimeType,
+                    category: probe.category,
+                    fileSize: probe.fileSize,
+                    title: probe.filename,
+                    platform: new URL(probe.finalUrl).hostname.replace(/^www\./, ""),
+                };
+            }
+        }
+
+        // Try yt-dlp extraction (video or audio mode, and primary path for auto)
+        let ytErrMessage = null;
         try {
-            const gallery = await runGalleryDlJson(urlStr, options);
+            const info = await runYtDlpJson(urlStr, execOpts);
+            const isCarousel = info._type === "playlist" && Array.isArray(info.entries);
+            const primaryEntry = isCarousel ? info.entries[0] || info : info;
+            const summary = summarizeMediaFormats(primaryEntry);
+
+            if (contentType === "audio") {
+                summary.presets = summary.presets.filter((p) => p.id === "audio");
+            }
+
+            return {
+                kind: "media",
+                url: urlStr,
+                title: info.title || primaryEntry.title || "Media Download",
+                uploader: info.uploader || info.channel || primaryEntry.uploader || null,
+                duration: info.duration || primaryEntry.duration || null,
+                thumbnail: info.thumbnail || primaryEntry.thumbnail || null,
+                platform: info.extractor_key || info.extractor || "Media",
+                isCarousel,
+                entryCount: isCarousel ? info.entries.length : 1,
+                ...summary,
+            };
+        } catch (ytErr) {
+            ytErrMessage = ytErr.message;
+        }
+
+        // If explicitly video or audio failed yt-dlp, check if URL is actually a direct video/audio file
+        if (contentType === "video" || contentType === "audio") {
+            const probe = await probeDirectHttp(urlStr);
+            if (probe && probe.isDirectFile) {
+                return {
+                    kind: "direct",
+                    url: probe.finalUrl,
+                    originalUrl: urlStr,
+                    filename: probe.filename,
+                    mimeType: probe.mimeType,
+                    category: probe.category,
+                    fileSize: probe.fileSize,
+                    title: probe.filename,
+                    platform: new URL(probe.finalUrl).hostname.replace(/^www\./, ""),
+                };
+            }
+            throw new Error(ytErrMessage || `Could not extract ${contentType} from this link.`);
+        }
+
+        // Auto fallback 2: gallery-dl extraction
+        try {
+            const gallery = await runGalleryDlJson(urlStr, execOpts);
             const title =
                 gallery.meta.description ||
                 gallery.meta.title ||
                 gallery.meta.content ||
-                `Images from ${new URL(urlStr).hostname.replace(/^www\./, "")}`;
+                `Gallery from ${new URL(urlStr).hostname.replace(/^www\./, "")}`;
             return {
                 kind: "gallery",
                 url: urlStr,
@@ -579,27 +742,10 @@ async function analyzeUrl(rawUrl, options = {}) {
                 items: gallery.items,
             };
         } catch {
-            const { title: pageTitle, assets } = await extractWebpageAssets(urlStr);
-            const imgAssets = assets.filter((a) => a.category === "image");
-            if (imgAssets.length > 0) {
-                return {
-                    kind: "webpage",
-                    url: urlStr,
-                    title: pageTitle || new URL(urlStr).hostname,
-                    platform: new URL(urlStr).hostname.replace(/^www\./, ""),
-                    assets: imgAssets,
-                    allowHtmlSave: false,
-                    note: `Found ${imgAssets.length} image(s) on this page.`,
-                };
-            }
-            throw new Error(
-                "No downloadable images found at this link. For Instagram/X login-gated posts, select your Browser Cookies."
-            );
+            // Fall through to direct probe & webpage asset extraction
         }
-    }
 
-    // For auto / audio on non-social hosts, probe HTTP headers first to detect direct files
-    if (contentType !== "video" && !isKnownMediaHost(urlStr)) {
+        // Auto fallback 3: Direct HTTP probe
         const probe = await probeDirectHttp(urlStr);
         if (probe && probe.isDirectFile) {
             return {
@@ -614,106 +760,22 @@ async function analyzeUrl(rawUrl, options = {}) {
                 platform: new URL(probe.finalUrl).hostname.replace(/^www\./, ""),
             };
         }
-    }
 
-    // Try yt-dlp extraction (video or audio mode, and primary path for auto)
-    let ytErrMessage = null;
-    try {
-        const info = await runYtDlpJson(urlStr, options);
-        const isCarousel = info._type === "playlist" && Array.isArray(info.entries);
-        const primaryEntry = isCarousel ? info.entries[0] || info : info;
-        const summary = summarizeMediaFormats(primaryEntry);
-
-        if (contentType === "audio") {
-            summary.presets = summary.presets.filter((p) => p.id === "audio");
-        }
-
+        // Auto fallback 4: Webpage asset extraction
+        const { title: pageTitle, assets } = await extractWebpageAssets(urlStr);
         return {
-            kind: "media",
+            kind: "webpage",
             url: urlStr,
-            title: info.title || primaryEntry.title || "Media Download",
-            uploader: info.uploader || info.channel || primaryEntry.uploader || null,
-            duration: info.duration || primaryEntry.duration || null,
-            thumbnail: info.thumbnail || primaryEntry.thumbnail || null,
-            platform: info.extractor_key || info.extractor || "Media",
-            isCarousel,
-            entryCount: isCarousel ? info.entries.length : 1,
-            ...summary,
+            title: pageTitle || new URL(urlStr).hostname,
+            platform: new URL(urlStr).hostname.replace(/^www\./, ""),
+            assets,
+            allowHtmlSave: true,
+            note:
+                assets.length > 0
+                    ? "Detected downloadable images, media, and files on this page."
+                    : ytErrMessage || "No embedded media matched; you can still save the webpage HTML.",
         };
-    } catch (ytErr) {
-        ytErrMessage = ytErr.message;
-    }
-
-    // If explicitly video or audio failed yt-dlp, check if URL is actually a direct video/audio file
-    if (contentType === "video" || contentType === "audio") {
-        const probe = await probeDirectHttp(urlStr);
-        if (probe && probe.isDirectFile) {
-            return {
-                kind: "direct",
-                url: probe.finalUrl,
-                originalUrl: urlStr,
-                filename: probe.filename,
-                mimeType: probe.mimeType,
-                category: probe.category,
-                fileSize: probe.fileSize,
-                title: probe.filename,
-                platform: new URL(probe.finalUrl).hostname.replace(/^www\./, ""),
-            };
-        }
-        throw new Error(ytErrMessage || `Could not extract ${contentType} from this link.`);
-    }
-
-    // Auto fallback 2: gallery-dl extraction
-    try {
-        const gallery = await runGalleryDlJson(urlStr, options);
-        const title =
-            gallery.meta.description ||
-            gallery.meta.title ||
-            gallery.meta.content ||
-            `Gallery from ${new URL(urlStr).hostname.replace(/^www\./, "")}`;
-        return {
-            kind: "gallery",
-            url: urlStr,
-            title: String(title).slice(0, 140),
-            uploader: gallery.meta.username || gallery.meta.author?.name || gallery.meta.user?.name || null,
-            platform: gallery.meta.category || new URL(urlStr).hostname.replace(/^www\./, ""),
-            itemCount: gallery.items.length,
-            items: gallery.items,
-        };
-    } catch {
-        // Fall through to direct probe & webpage asset extraction
-    }
-
-    // Auto fallback 3: Direct HTTP probe
-    const probe = await probeDirectHttp(urlStr);
-    if (probe && probe.isDirectFile) {
-        return {
-            kind: "direct",
-            url: probe.finalUrl,
-            originalUrl: urlStr,
-            filename: probe.filename,
-            mimeType: probe.mimeType,
-            category: probe.category,
-            fileSize: probe.fileSize,
-            title: probe.filename,
-            platform: new URL(probe.finalUrl).hostname.replace(/^www\./, ""),
-        };
-    }
-
-    // Auto fallback 4: Webpage asset extraction
-    const { title: pageTitle, assets } = await extractWebpageAssets(urlStr);
-    return {
-        kind: "webpage",
-        url: urlStr,
-        title: pageTitle || new URL(urlStr).hostname,
-        platform: new URL(urlStr).hostname.replace(/^www\./, ""),
-        assets,
-        allowHtmlSave: true,
-        note:
-            assets.length > 0
-                ? "Detected downloadable images, media, and files on this page."
-                : ytErrMessage || "No embedded media matched; you can still save the webpage HTML.",
-    };
+    });
 }
 
 module.exports = {
@@ -722,5 +784,8 @@ module.exports = {
     isKnownMediaHost,
     probeDirectHttp,
     buildCookieArgs,
+    withCookieFile,
+    getYtDlpBaseArgs,
+    resolveShareRedirect,
     DEFAULT_HEADERS,
 };

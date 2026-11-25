@@ -69,8 +69,8 @@ app.get("/api/health", (req, res) => {
 
 app.post("/api/analyze", apiLimiter, async (req, res) => {
     try {
-        const { url, cookiesBrowser, contentType } = req.body || {};
-        const result = await analyzeUrl(url, { cookiesBrowser, contentType });
+        const { url, cookiesBrowser, cookiesTxt, contentType } = req.body || {};
+        const result = await analyzeUrl(url, { cookiesBrowser, cookiesTxt, contentType });
         res.json(result);
     } catch (err) {
         res.status(400).json({ error: err.message || "Unable to analyze URL" });
@@ -79,13 +79,22 @@ app.post("/api/analyze", apiLimiter, async (req, res) => {
 
 app.post("/api/downloads", apiLimiter, async (req, res) => {
     try {
-        const { url, quality, container, cookiesBrowser, customFilename, forceDirect, contentType } =
-            req.body || {};
+        const {
+            url,
+            quality,
+            container,
+            cookiesBrowser,
+            cookiesTxt,
+            customFilename,
+            forceDirect,
+            contentType,
+        } = req.body || {};
         const job = await jobManager.startDownload({
             url,
             quality,
             container,
             cookiesBrowser,
+            cookiesTxt,
             customFilename,
             forceDirect: Boolean(forceDirect),
             contentType,

@@ -10,6 +10,10 @@ const containerGroup = document.getElementById("containerGroup");
 const contentTypePills = document.getElementById("contentTypePills");
 const contentTypeHint = document.getElementById("contentTypeHint");
 const cookiesSelect = document.getElementById("cookiesSelect");
+const cookiesTxtPanel = document.getElementById("cookiesTxtPanel");
+const cookiesFileInput = document.getElementById("cookiesFileInput");
+const cookiesTxtArea = document.getElementById("cookiesTxtArea");
+const clearCookiesBtn = document.getElementById("clearCookiesBtn");
 const filenameInput = document.getElementById("filenameInput");
 
 let selectedContentType = "auto";
@@ -85,11 +89,27 @@ async function loadHealth() {
         const galleryPill = data.binaries.galleryDl?.available
             ? `<span class="pill pill-ok">gallery-dl ready (images)</span>`
             : `<span class="pill pill-warn">gallery-dl missing</span>`;
+        const cookiePill = data.binaries.serverCookies?.available
+            ? `<span class="pill pill-ok">server cookies ready</span>`
+            : "";
 
-        engineStatus.innerHTML = `${ytdlpPill}${ffmpegPill}${galleryPill}`;
+        engineStatus.innerHTML = `${ytdlpPill}${ffmpegPill}${galleryPill}${cookiePill}`;
     } catch {
         engineStatus.innerHTML = `<span class="pill pill-warn">Server status unavailable</span>`;
     }
+}
+
+function getCookiePayload() {
+    if (cookiesSelect.value === "cookies_txt") {
+        return {
+            cookiesBrowser: "",
+            cookiesTxt: cookiesTxtArea.value.trim(),
+        };
+    }
+    return {
+        cookiesBrowser: cookiesSelect.value,
+        cookiesTxt: "",
+    };
 }
 
 async function inspectCurrentUrl() {
@@ -105,12 +125,14 @@ async function inspectCurrentUrl() {
     previewCard.classList.add("hidden");
 
     try {
+        const { cookiesBrowser, cookiesTxt } = getCookiePayload();
         const res = await fetch("/api/analyze", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
                 url,
-                cookiesBrowser: cookiesSelect.value,
+                cookiesBrowser,
+                cookiesTxt,
                 contentType: selectedContentType,
             }),
         });
@@ -300,6 +322,7 @@ async function startDownload(overrideUrl, overrideQuality, forceDirect = false) 
     downloadBtn.disabled = true;
 
     try {
+        const { cookiesBrowser, cookiesTxt } = getCookiePayload();
         const res = await fetch("/api/downloads", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -307,7 +330,8 @@ async function startDownload(overrideUrl, overrideQuality, forceDirect = false) 
                 url,
                 quality: overrideQuality || qualitySelect.value,
                 container: containerSelect.value,
-                cookiesBrowser: cookiesSelect.value,
+                cookiesBrowser,
+                cookiesTxt,
                 customFilename: filenameInput.value.trim(),
                 forceDirect,
                 contentType: forceDirect ? "auto" : selectedContentType,
@@ -501,6 +525,41 @@ contentTypePills.querySelectorAll("[data-content-type]").forEach((btn) => {
     btn.addEventListener("click", () => {
         setContentType(btn.getAttribute("data-content-type"));
     });
+});
+
+const COOKIES_STORAGE_KEY = "ud_cookies_txt";
+
+const savedCookiesTxt = sessionStorage.getItem(COOKIES_STORAGE_KEY) || "";
+if (savedCookiesTxt) {
+    cookiesTxtArea.value = savedCookiesTxt;
+    cookiesSelect.value = "cookies_txt";
+    cookiesTxtPanel.classList.remove("hidden");
+}
+
+cookiesSelect.addEventListener("change", () => {
+    const showTxt = cookiesSelect.value === "cookies_txt";
+    cookiesTxtPanel.classList.toggle("hidden", !showTxt);
+});
+
+cookiesTxtArea.addEventListener("input", () => {
+    sessionStorage.setItem(COOKIES_STORAGE_KEY, cookiesTxtArea.value);
+});
+
+cookiesFileInput.addEventListener("change", async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const text = await file.text();
+    cookiesTxtArea.value = text;
+    sessionStorage.setItem(COOKIES_STORAGE_KEY, text);
+    cookiesSelect.value = "cookies_txt";
+    cookiesTxtPanel.classList.remove("hidden");
+    showBanner(`Loaded cookies file "${file.name}" for this browser session.`, "info");
+});
+
+clearCookiesBtn.addEventListener("click", () => {
+    cookiesTxtArea.value = "";
+    cookiesFileInput.value = "";
+    sessionStorage.removeItem(COOKIES_STORAGE_KEY);
 });
 
 pasteBtn.addEventListener("click", async () => {

@@ -76,14 +76,15 @@
                         </div>
 
                         <div class="option-group">
-                            <label for="cookiesSelect">Browser Cookies (for private/IG/X)</label>
+                            <label for="cookiesSelect">Authentication / Cookies</label>
                             <select id="cookiesSelect">
                                 <option value="" selected>None (Public links)</option>
-                                <option value="chrome">Google Chrome</option>
-                                <option value="safari">Safari</option>
-                                <option value="firefox">Firefox</option>
-                                <option value="brave">Brave</option>
-                                <option value="edge">Microsoft Edge</option>
+                                <option value="cookies_txt">Upload / Paste cookies.txt (Render / Cloud)</option>
+                                <option value="chrome">Chrome (Local machine only)</option>
+                                <option value="safari">Safari (Local machine only)</option>
+                                <option value="firefox">Firefox (Local machine only)</option>
+                                <option value="brave">Brave (Local machine only)</option>
+                                <option value="edge">Edge (Local machine only)</option>
                             </select>
                         </div>
 
@@ -91,6 +92,23 @@
                             <label for="filenameInput">Custom Filename (optional)</label>
                             <input id="filenameInput" type="text" placeholder="Auto-detect from link" />
                         </div>
+                    </div>
+
+                    <div id="cookiesTxtPanel" class="cookies-panel hidden">
+                        <div class="cookies-panel-header">
+                            <div>
+                                <strong>Netscape cookies.txt (for YouTube / Instagram / Reddit on cloud servers)</strong>
+                                <p class="section-sub">Export using a browser extension like "Get cookies.txt LOCALLY", then upload or paste below. Used only per request in memory/temp and deleted immediately.</p>
+                            </div>
+                            <div class="cookies-panel-actions">
+                                <label class="btn btn-secondary btn-sm file-upload-label">
+                                    Upload .txt
+                                    <input id="cookiesFileInput" type="file" accept=".txt,text/plain" class="sr-only" />
+                                </label>
+                                <button type="button" id="clearCookiesBtn" class="btn btn-danger btn-sm">Clear</button>
+                            </div>
+                        </div>
+                        <textarea id="cookiesTxtArea" rows="3" placeholder="# Netscape HTTP Cookie File&#10;.youtube.com&#9;TRUE&#9;/&#9;TRUE&#9;..."></textarea>
                     </div>
                 </form>
 

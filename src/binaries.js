@@ -66,6 +66,7 @@ function getBinaryStatus() {
     const ytdlpPath = resolveYtDlpPath();
     const ffmpegPath = resolveFfmpegPath();
     const galleryDlPath = resolveGalleryDlPath();
+    const serverCookiePath = process.env.COOKIES_FILE || "/etc/secrets/cookies.txt";
     return {
         ytdlp: {
             available: Boolean(ytdlpPath),
@@ -78,6 +79,9 @@ function getBinaryStatus() {
         galleryDl: {
             available: Boolean(galleryDlPath),
             path: galleryDlPath,
+        },
+        serverCookies: {
+            available: Boolean(serverCookiePath && fs.existsSync(serverCookiePath)),
         },
     };
 }

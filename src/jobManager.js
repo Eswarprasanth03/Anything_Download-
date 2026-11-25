@@ -11,6 +11,9 @@ const {
     isKnownMediaHost,
     probeDirectHttp,
     buildCookieArgs,
+    withCookieFile,
+    getYtDlpBaseArgs,
+    resolveShareRedirect,
     DEFAULT_HEADERS,
 } = require("./analyzer");
 const {
@@ -75,6 +78,7 @@ class JobManager extends EventEmitter {
         quality = "4k",
         container = "mp4",
         cookiesBrowser = "",
+        cookiesTxt = "",
         customFilename = "",
         forceDirect = false,
         contentType = "auto",
@@ -110,15 +114,18 @@ class JobManager extends EventEmitter {
         this.jobs.set(id, job);
         this.emit("job", { ...job });
 
-        this._executeJob(id, {
-            url: cleanUrl,
-            quality: job.quality,
-            container,
-            cookiesBrowser,
-            customFilename,
-            forceDirect,
-            contentType: normalizedType,
-        }).catch((err) => {
+        withCookieFile(cookiesTxt, (tempCookieFilePath) =>
+            this._executeJob(id, {
+                url: cleanUrl,
+                quality: job.quality,
+                container,
+                cookiesBrowser,
+                tempCookieFilePath,
+                customFilename,
+                forceDirect,
+                contentType: normalizedType,
+            })
+        ).catch((err) => {
             const current = this.jobs.get(id);
             if (current && current.status !== "cancelled") {
                 this.updateJob(id, {
@@ -133,7 +140,9 @@ class JobManager extends EventEmitter {
     }
 
     async _executeJob(id, opts) {
-        const { url, forceDirect, contentType } = opts;
+        const { forceDirect, contentType } = opts;
+        const url = await resolveShareRedirect(opts.url);
+        const resolvedOpts = { ...opts, url };
 
         // 1. Direct file download when forced, when user selected "webpage" (Save HTML), or when user selected "document"
         if (forceDirect || contentType === "webpage") {
@@ -145,7 +154,7 @@ class JobManager extends EventEmitter {
                 totalBytes: probe?.fileSize || null,
                 message: `Downloading ${probe?.mimeType || "file"}...`,
             });
-            await this._downloadDirect(id, probe?.finalUrl || url, probe, opts.customFilename);
+            await this._downloadDirect(id, probe?.finalUrl || url, probe, resolvedOpts.customFilename);
             return;
         }
 
@@ -166,7 +175,7 @@ class JobManager extends EventEmitter {
                 totalBytes: probe.fileSize,
                 message: `Downloading ${probe.category} (${probe.mimeType})...`,
             });
-            await this._downloadDirect(id, probe.finalUrl || url, probe, opts.customFilename);
+            await this._downloadDirect(id, probe.finalUrl || url, probe, resolvedOpts.customFilename);
             return;
         }
 
@@ -181,7 +190,7 @@ class JobManager extends EventEmitter {
                     totalBytes: probe.fileSize,
                     message: `Downloading ${probe.category} (${probe.mimeType})...`,
                 });
-                await this._downloadDirect(id, probe.finalUrl || url, probe, opts.customFilename);
+                await this._downloadDirect(id, probe.finalUrl || url, probe, resolvedOpts.customFilename);
                 return;
             }
             const galleryDlPath = resolveGalleryDlPath();
@@ -192,13 +201,13 @@ class JobManager extends EventEmitter {
                     progress: 10,
                     message: "Extracting image(s) / gallery...",
                 });
-                await this._downloadWithGalleryDl(id, opts, galleryDlPath);
+                await this._downloadWithGalleryDl(id, resolvedOpts, galleryDlPath);
                 return;
             }
             throw new Error("No direct image or supported gallery found. Try \"Inspect Link\" to extract images from the page.");
         }
 
-        // 3. Auto / Video / Audio: probe direct files on non-social hosts (skip probe in explicit video mode unless yt-dlp fails)
+        // 3. Auto / Video / Audio: probe direct files on non-social hosts
         let probe = null;
         if (contentType !== "video" && !isKnownMediaHost(url)) {
             probe = await probeDirectHttp(url);
@@ -210,12 +219,13 @@ class JobManager extends EventEmitter {
                     totalBytes: probe.fileSize,
                     message: `Downloading ${probe.category} (${probe.mimeType})...`,
                 });
-                await this._downloadDirect(id, probe.finalUrl || url, probe, opts.customFilename);
+                await this._downloadDirect(id, probe.finalUrl || url, probe, resolvedOpts.customFilename);
                 return;
             }
         }
 
         // 4. yt-dlp for video/audio links
+        let ytErr = null;
         const ytdlpPath = resolveYtDlpPath();
         if (ytdlpPath) {
             this.updateJob(id, {
@@ -224,30 +234,34 @@ class JobManager extends EventEmitter {
                 message: contentType === "audio" ? "Extracting audio stream..." : "Fetching media streams...",
             });
             try {
-                await this._downloadWithYtDlp(id, opts, ytdlpPath);
+                await this._downloadWithYtDlp(id, resolvedOpts, ytdlpPath);
                 return;
-            } catch (ytErr) {
-                if (this.getJob(id)?.status === "cancelled") throw ytErr;
-                if (contentType === "audio") {
+            } catch (err) {
+                ytErr = err;
+                if (this.getJob(id)?.status === "cancelled") throw err;
+                if (contentType === "audio" || contentType === "video") {
                     const directProbe = probe || (await probeDirectHttp(url));
                     if (directProbe && directProbe.isDirectFile) {
-                        await this._downloadDirect(id, directProbe.finalUrl || url, directProbe, opts.customFilename);
+                        await this._downloadDirect(
+                            id,
+                            directProbe.finalUrl || url,
+                            directProbe,
+                            resolvedOpts.customFilename
+                        );
                         return;
                     }
-                    throw ytErr;
+                    throw err;
                 }
-                if (contentType === "video") {
-                    const directProbe = await probeDirectHttp(url);
-                    if (directProbe && directProbe.isDirectFile) {
-                        await this._downloadDirect(id, directProbe.finalUrl || url, directProbe, opts.customFilename);
-                        return;
-                    }
-                    throw ytErr;
+                // If yt-dlp specifically hit a bot/auth error, do not fall through to gallery-dl and mask the error
+                const msg = err.message || "";
+                if (/sign in|confirm you.?re not a bot|cookies|login|403|blocked/i.test(msg)) {
+                    throw err;
                 }
             }
         }
 
         // 5. Auto fallback: gallery-dl for images/photo posts/carousels
+        let galErr = null;
         const galleryDlPath = resolveGalleryDlPath();
         if (galleryDlPath) {
             this.updateJob(id, {
@@ -257,10 +271,11 @@ class JobManager extends EventEmitter {
                 message: "Extracting images / gallery items...",
             });
             try {
-                await this._downloadWithGalleryDl(id, opts, galleryDlPath);
+                await this._downloadWithGalleryDl(id, resolvedOpts, galleryDlPath);
                 return;
-            } catch (galErr) {
-                if (this.getJob(id)?.status === "cancelled") throw galErr;
+            } catch (err) {
+                galErr = err;
+                if (this.getJob(id)?.status === "cancelled") throw err;
             }
         }
 
@@ -278,13 +293,15 @@ class JobManager extends EventEmitter {
                 id,
                 fallbackProbe.finalUrl || url,
                 fallbackProbe,
-                opts.customFilename
+                resolvedOpts.customFilename
             );
             return;
         }
 
+        const primaryError = ytErr?.message || galErr?.message;
         throw new Error(
-            "Could not extract media directly from this link. Try clicking \"Inspect Link\" to view downloadable images/files on the page, or select Browser Cookies if login is required."
+            primaryError ||
+                "Could not extract media directly from this link. Try clicking \"Inspect Link\" to view downloadable images/files on the page, or upload a cookies.txt file if login is required."
         );
     }
 
@@ -413,7 +430,7 @@ class JobManager extends EventEmitter {
             "directory=[]",
             "--range",
             "1-30",
-            ...buildCookieArgs(opts.cookiesBrowser),
+            ...buildCookieArgs(opts.cookiesBrowser, opts.tempCookieFilePath),
             opts.url,
         ];
 
@@ -577,6 +594,7 @@ class JobManager extends EventEmitter {
             : path.join(stagingDir, `%(title).120B [%(id)s] [${safeQualityTag}].%(ext)s`);
 
         const args = [
+            ...getYtDlpBaseArgs(),
             "--no-playlist",
             "--no-warnings",
             "--newline",
@@ -593,7 +611,7 @@ class JobManager extends EventEmitter {
             ...extraArgs,
             ...(quality !== "audio" && ffmpegPath ? ["--merge-output-format", mergeFormat] : []),
             ...(ffmpegPath ? ["--ffmpeg-location", ffmpegPath] : []),
-            ...buildCookieArgs(cookiesBrowser),
+            ...buildCookieArgs(cookiesBrowser, opts.tempCookieFilePath),
             "-o",
             outputTemplate,
             opts.url,
@@ -712,8 +730,11 @@ class JobManager extends EventEmitter {
                     const errMsg = cleanErr || stderrBuffer.trim() || `yt-dlp exited with code ${code}`;
                     return reject(
                         new Error(
-                            errMsg.includes("cookies") || errMsg.includes("Sign in") || errMsg.includes("login")
-                                ? `${errMsg} — Select a browser under "Browser Cookies" and try again.`
+                            errMsg.includes("cookies") ||
+                                errMsg.includes("Sign in") ||
+                                errMsg.includes("login") ||
+                                errMsg.includes("bot")
+                                ? `${errMsg} — Upload a cookies.txt file under Cookies (required on cloud servers like Render).`
                                 : errMsg
                         )
                     );

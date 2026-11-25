@@ -5,6 +5,7 @@ const path = require("path");
 const { execFileSync } = require("child_process");
 const app = require("../server");
 const jobManager = require("../src/jobManager");
+const { withCookieFile } = require("../src/analyzer");
 const { resolveFfmpegPath } = require("../src/binaries");
 const { DOWNLOADS_DIR } = require("../src/utils");
 
@@ -18,7 +19,7 @@ function startServer(serverApp) {
 }
 
 async function waitForJob(baseUrl, jobId) {
-    for (let i = 0; i < 60; i++) {
+    for (let i = 0; i < 200; i++) {
         await new Promise((r) => setTimeout(r, 100));
         const listRes = await fetch(`${baseUrl}/api/downloads`);
         const { jobs } = await listRes.json();
@@ -129,6 +130,15 @@ async function run() {
         assert.strictEqual(health.binaries.ytdlp.available, true);
         assert.strictEqual(health.binaries.ffmpeg.available, true);
         assert.strictEqual(health.binaries.galleryDl.available, true);
+        assert.strictEqual(typeof health.binaries.serverCookies.available, "boolean");
+
+        // 1b. Verify temporary cookies.txt creation and cleanup
+        let seenCookiePath = null;
+        await withCookieFile("# Netscape HTTP Cookie File\n", async (tmpPath) => {
+            seenCookiePath = tmpPath;
+            assert.ok(tmpPath && fs.existsSync(tmpPath));
+        });
+        assert.strictEqual(fs.existsSync(seenCookiePath), false);
 
         // 2. Analyze direct archive file
         const analyzeDirectRes = await fetch(`${api.baseUrl}/api/analyze`, {

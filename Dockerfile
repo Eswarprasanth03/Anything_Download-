@@ -7,7 +7,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-pip \
     ffmpeg \
     ca-certificates \
-    && pip3 install --no-cache-dir --break-system-packages yt-dlp gallery-dl \
+    && pip3 install --no-cache-dir --break-system-packages "yt-dlp[default,curl-cffi]" gallery-dl \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 

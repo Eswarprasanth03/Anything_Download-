@@ -216,6 +216,49 @@ h1 {
     opacity: 0.45;
 }
 
+.cookies-panel {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 12px 14px;
+    display: grid;
+    gap: 10px;
+}
+
+.cookies-panel-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 12px;
+    flex-wrap: wrap;
+}
+
+.cookies-panel-actions {
+    display: flex;
+    gap: 8px;
+}
+
+.file-upload-label {
+    cursor: pointer;
+}
+
+.cookies-panel textarea {
+    width: 100%;
+    padding: 9px 12px;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    background: var(--surface);
+    color: var(--text);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.78rem;
+    resize: vertical;
+    outline: none;
+}
+
+.cookies-panel textarea:focus {
+    border-color: var(--accent);
+}
+
 .options-row {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));

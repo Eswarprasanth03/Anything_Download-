@@ -188,11 +188,12 @@ async function withCookieFile(cookiesTxt, fn) {
     if (!cookiesTxt || typeof cookiesTxt !== "string" || !cookiesTxt.trim()) {
         return fn(null);
     }
-    if (cookiesTxt.length > 512 * 1024) {
+    const normalized = cookiesTxt.replace(/\r\n/g, "\n").trim() + "\n";
+    if (normalized.length > 512 * 1024) {
         throw new Error("cookies.txt file is too large (max 512 KB).");
     }
     const tmpPath = path.join(os.tmpdir(), `yt_cookies_${crypto.randomUUID()}.txt`);
-    fs.writeFileSync(tmpPath, cookiesTxt, { mode: 0o600 });
+    fs.writeFileSync(tmpPath, normalized, { mode: 0o600 });
     try {
         return await fn(tmpPath);
     } finally {

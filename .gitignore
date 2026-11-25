@@ -3,3 +3,5 @@ bin/
 downloads/
 .venv/
 .DS_Store
+cookies.txt
+*cookies*.txt

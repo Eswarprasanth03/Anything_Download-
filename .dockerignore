@@ -5,3 +5,5 @@ downloads
 .git
 .DS_Store
 test
+cookies.txt
+*cookies*.txt

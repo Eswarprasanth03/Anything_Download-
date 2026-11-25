@@ -14,6 +14,7 @@ const cookiesTxtPanel = document.getElementById("cookiesTxtPanel");
 const cookiesFileInput = document.getElementById("cookiesFileInput");
 const cookiesTxtArea = document.getElementById("cookiesTxtArea");
 const clearCookiesBtn = document.getElementById("clearCookiesBtn");
+const cookiesStatusBadge = document.getElementById("cookiesStatusBadge");
 const filenameInput = document.getElementById("filenameInput");
 
 let selectedContentType = "auto";
@@ -64,8 +65,22 @@ function formatDuration(seconds) {
     return `${mins}:${String(secs).padStart(2, "0")}`;
 }
 
-function showBanner(message, type = "info") {
-    statusBanner.textContent = message;
+function showBanner(message, type = "info", { showCookieAction = false } = {}) {
+    statusBanner.innerHTML = "";
+    const msgSpan = document.createElement("span");
+    msgSpan.textContent = message;
+    statusBanner.appendChild(msgSpan);
+
+    if (showCookieAction) {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "btn btn-secondary btn-sm";
+        btn.style.marginLeft = "10px";
+        btn.textContent = "Load cookies.txt";
+        btn.addEventListener("click", openCookiesPanel);
+        statusBanner.appendChild(btn);
+    }
+
     statusBanner.className = `status-banner ${type}`;
     statusBanner.classList.remove("hidden");
 }
@@ -142,7 +157,8 @@ async function inspectCurrentUrl() {
         }
         renderPreview(data);
     } catch (err) {
-        showBanner(err.message, "error");
+        const needsCookies = /cookies|sign in|bot|login/i.test(err.message);
+        showBanner(err.message, "error", { showCookieAction: needsCookies });
     } finally {
         analyzeBtn.disabled = false;
         analyzeBtn.textContent = "Inspect Link";
@@ -344,7 +360,8 @@ async function startDownload(overrideUrl, overrideQuality, forceDirect = false) 
         jobsMap.set(data.id, data);
         renderJobs();
     } catch (err) {
-        showBanner(err.message, "error");
+        const needsCookies = /cookies|sign in|bot|login/i.test(err.message);
+        showBanner(err.message, "error", { showCookieAction: needsCookies });
     } finally {
         downloadBtn.disabled = false;
     }
@@ -529,20 +546,44 @@ contentTypePills.querySelectorAll("[data-content-type]").forEach((btn) => {
 
 const COOKIES_STORAGE_KEY = "ud_cookies_txt";
 
+function updateCookiesStatusBadge() {
+    const lines = cookiesTxtArea.value
+        .split(/\r?\n/)
+        .map((l) => l.trim())
+        .filter((l) => l && !l.startsWith("#"));
+    if (lines.length > 0) {
+        cookiesStatusBadge.textContent = `Loaded (${lines.length} entries)`;
+        cookiesStatusBadge.className = "pill pill-ok";
+    } else {
+        cookiesStatusBadge.textContent = "Not loaded";
+        cookiesStatusBadge.className = "pill pill-muted";
+    }
+}
+
+function openCookiesPanel() {
+    cookiesSelect.value = "cookies_txt";
+    cookiesTxtPanel.classList.remove("hidden");
+    cookiesTxtPanel.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    updateCookiesStatusBadge();
+}
+
 const savedCookiesTxt = sessionStorage.getItem(COOKIES_STORAGE_KEY) || "";
 if (savedCookiesTxt) {
     cookiesTxtArea.value = savedCookiesTxt;
     cookiesSelect.value = "cookies_txt";
     cookiesTxtPanel.classList.remove("hidden");
 }
+updateCookiesStatusBadge();
 
 cookiesSelect.addEventListener("change", () => {
     const showTxt = cookiesSelect.value === "cookies_txt";
     cookiesTxtPanel.classList.toggle("hidden", !showTxt);
+    updateCookiesStatusBadge();
 });
 
 cookiesTxtArea.addEventListener("input", () => {
     sessionStorage.setItem(COOKIES_STORAGE_KEY, cookiesTxtArea.value);
+    updateCookiesStatusBadge();
 });
 
 cookiesFileInput.addEventListener("change", async (e) => {
@@ -553,6 +594,7 @@ cookiesFileInput.addEventListener("change", async (e) => {
     sessionStorage.setItem(COOKIES_STORAGE_KEY, text);
     cookiesSelect.value = "cookies_txt";
     cookiesTxtPanel.classList.remove("hidden");
+    updateCookiesStatusBadge();
     showBanner(`Loaded cookies file "${file.name}" for this browser session.`, "info");
 });
 
@@ -560,6 +602,7 @@ clearCookiesBtn.addEventListener("click", () => {
     cookiesTxtArea.value = "";
     cookiesFileInput.value = "";
     sessionStorage.removeItem(COOKIES_STORAGE_KEY);
+    updateCookiesStatusBadge();
 });
 
 pasteBtn.addEventListener("click", async () => {

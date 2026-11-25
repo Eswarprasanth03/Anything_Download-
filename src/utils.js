@@ -1,7 +1,9 @@
 const fs = require("fs");
 const path = require("path");
 
-const DOWNLOADS_DIR = path.resolve(__dirname, "..", "downloads");
+const DOWNLOADS_DIR = process.env.DOWNLOADS_DIR
+    ? path.resolve(process.env.DOWNLOADS_DIR)
+    : path.resolve(__dirname, "..", "downloads");
 
 function ensureDirSync(dirPath) {
     if (!fs.existsSync(dirPath)) {

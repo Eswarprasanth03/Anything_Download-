@@ -1,3 +1,4 @@
+const fs = require("fs");
 const path = require("path");
 const { execFile } = require("child_process");
 const mime = require("mime-types");
@@ -170,6 +171,10 @@ function buildCookieArgs(cookiesBrowser) {
     const allowed = new Set(["chrome", "safari", "firefox", "edge", "brave", "chromium"]);
     if (cookiesBrowser && allowed.has(cookiesBrowser.toLowerCase())) {
         return ["--cookies-from-browser", cookiesBrowser.toLowerCase()];
+    }
+    const secretCookieFile = process.env.COOKIES_FILE || "/etc/secrets/cookies.txt";
+    if (secretCookieFile && fs.existsSync(secretCookieFile)) {
+        return ["--cookies", secretCookieFile];
     }
     return [];
 }

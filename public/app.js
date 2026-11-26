@@ -24,6 +24,11 @@ const refreshFilesBtn = document.getElementById("refreshFilesBtn");
 const jobsMap = new Map();
 let selectedContentType = "auto";
 let localBrowserCookiesAllowed = false;
+const MAX_SHARE_BYTES = 50 * 1024 * 1024;
+const canNativeFileShare =
+    typeof navigator !== "undefined" &&
+    typeof navigator.share === "function" &&
+    typeof navigator.canShare === "function";
 
 function getApiBase() {
     if (typeof window.API_BASE_URL === "string" && window.API_BASE_URL.trim()) {
@@ -43,6 +48,44 @@ function apiFetch(endpointPath, options = {}) {
         credentials: "include",
         ...options,
     });
+}
+
+function supportsFileShare(file) {
+    if (!canNativeFileShare || !file || file.size > MAX_SHARE_BYTES) return false;
+    try {
+        const probe = new File([""], file.name || "file", {
+            type: file.mimeType || "application/octet-stream",
+        });
+        return navigator.canShare({ files: [probe] });
+    } catch {
+        return false;
+    }
+}
+
+async function shareFileToDevice(filename, mimeType, triggerBtn) {
+    const originalText = triggerBtn?.textContent || "Share / Photos";
+    if (triggerBtn) {
+        triggerBtn.disabled = true;
+        triggerBtn.textContent = "Preparing...";
+    }
+    try {
+        const res = await apiFetch(`/api/files/${encodeURIComponent(filename)}`);
+        if (!res.ok) throw new Error("Unable to fetch file for sharing");
+        const blob = await res.blob();
+        const fileObj = new File([blob], filename, {
+            type: mimeType || blob.type || "application/octet-stream",
+        });
+        await navigator.share({ files: [fileObj], title: filename });
+    } catch (err) {
+        if (err && err.name !== "AbortError") {
+            showBanner(err.message || "Share not supported for this file — tap Save to Device instead.", "info");
+        }
+    } finally {
+        if (triggerBtn) {
+            triggerBtn.disabled = false;
+            triggerBtn.textContent = originalText;
+        }
+    }
 }
 
 const CONTENT_TYPE_HINTS = {
@@ -105,10 +148,10 @@ async function loadHealth() {
         const ttlMins = data.limits?.fileTtlMs ? Math.round(data.limits.fileTtlMs / 60000) : 60;
         const maxMb = data.limits?.maxDownloadBytes
             ? Math.round(data.limits.maxDownloadBytes / (1024 * 1024))
-            : 500;
+            : 200;
         downloadsDirLabel.textContent = data.downloadsDir
-            ? `Folder: ${data.downloadsDir} · Auto-cleanup: ${ttlMins}m · Max file: ${maxMb} MB`
-            : `Isolated guest storage · Files auto-expire after ${ttlMins} min · Max file: ${maxMb} MB`;
+            ? `Folder: ${data.downloadsDir} · Auto-cleanup: ${ttlMins}m · Max file: ${maxMb} MB · Tap Save to Device to store locally`
+            : `Isolated guest storage (${ttlMins}m TTL · Max ${maxMb} MB) · Tap Save to Device to store in your device Downloads/Files`;
 
         const ytdlpPill = data.binaries.ytdlp.available
             ? `<span class="pill pill-ok">yt-dlp ready</span>`
@@ -423,7 +466,7 @@ function renderJobs() {
                             }
                             ${
                                 job.status === "completed" && savedFiles.length === 1
-                                    ? `<a class="btn btn-primary btn-sm" href="${escapeHtml(apiUrl(`/api/files/${encodeURIComponent(savedFiles[0])}`))}">Save File</a>`
+                                    ? `<a class="btn btn-primary btn-sm" href="${escapeHtml(apiUrl(`/api/files/${encodeURIComponent(savedFiles[0])}`))}" download="${escapeHtml(savedFiles[0])}">Save to Device</a>`
                                     : job.status === "completed" && savedFiles.length > 1
                                         ? `<span class="pill pill-ok">${savedFiles.length} files saved below</span>`
                                         : ""
@@ -443,6 +486,21 @@ function renderJobs() {
     });
 }
 
+async function syncJobs() {
+    try {
+        const res = await apiFetch("/api/downloads");
+        if (!res.ok) return;
+        const data = await res.json();
+        jobsMap.clear();
+        for (const job of data.jobs || []) {
+            jobsMap.set(job.id, job);
+        }
+        renderJobs();
+    } catch {
+        // Ignore transient sync errors
+    }
+}
+
 async function loadFiles() {
     try {
         const res = await apiFetch("/api/files");
@@ -459,6 +517,9 @@ async function loadFiles() {
                 const isImg = (file.mimeType || "").startsWith("image/");
                 const downloadUrl = apiUrl(`/api/files/${encodeURIComponent(file.name)}`);
                 const inlineUrl = apiUrl(`/api/files/${encodeURIComponent(file.name)}?inline=1`);
+                const shareBtn = supportsFileShare(file)
+                    ? `<button type="button" class="btn btn-secondary btn-sm" data-share-file="${escapeHtml(file.name)}" data-share-mime="${escapeHtml(file.mimeType)}">Share / Photos</button>`
+                    : "";
                 return `
                 <div class="file-item">
                     <div class="file-left">
@@ -470,13 +531,24 @@ async function loadFiles() {
                     </div>
                     <div class="file-actions">
                         <a class="btn btn-secondary btn-sm" href="${escapeHtml(inlineUrl)}" target="_blank" rel="noopener">Preview</a>
-                        <a class="btn btn-primary btn-sm" href="${escapeHtml(downloadUrl)}">Download</a>
+                        <a class="btn btn-primary btn-sm" href="${escapeHtml(downloadUrl)}" download="${escapeHtml(file.name)}">Save to Device</a>
+                        ${shareBtn}
                         <button type="button" class="btn btn-danger btn-sm" data-delete-file="${escapeHtml(file.name)}">Delete</button>
                     </div>
                 </div>
             `;
             })
             .join("");
+
+        filesList.querySelectorAll("[data-share-file]").forEach((btn) => {
+            btn.addEventListener("click", () => {
+                shareFileToDevice(
+                    btn.getAttribute("data-share-file"),
+                    btn.getAttribute("data-share-mime"),
+                    btn
+                );
+            });
+        });
 
         filesList.querySelectorAll("[data-delete-file]").forEach((btn) => {
             btn.addEventListener("click", async () => {
@@ -492,6 +564,10 @@ async function loadFiles() {
 
 function connectEvents() {
     const evtSource = new EventSource(apiUrl("/api/events"), { withCredentials: true });
+    evtSource.addEventListener("open", () => {
+        syncJobs();
+        loadFiles();
+    });
     evtSource.addEventListener("init", (event) => {
         const payload = JSON.parse(event.data);
         jobsMap.clear();
@@ -510,6 +586,23 @@ function connectEvents() {
         }
     });
 }
+
+document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") {
+        syncJobs();
+        loadFiles();
+    }
+});
+
+window.addEventListener("pageshow", () => {
+    syncJobs();
+    loadFiles();
+});
+
+window.addEventListener("online", () => {
+    syncJobs();
+    loadFiles();
+});
 
 function syncContainerForQuality() {
     const needsVideoQuality = selectedContentType === "auto" || selectedContentType === "video";
@@ -553,7 +646,7 @@ pasteBtn.addEventListener("click", async () => {
         const text = await navigator.clipboard.readText();
         if (text) urlInput.value = text.trim();
     } catch {
-        showBanner("Clipboard read was blocked by your browser — paste with Cmd+V.", "info");
+        showBanner("Clipboard read was blocked by your browser — paste manually.", "info");
     }
 });
 

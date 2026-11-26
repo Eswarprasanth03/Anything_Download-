@@ -33,17 +33,69 @@ class JobManager extends EventEmitter {
         super();
         this.jobs = new Map();
         this.controllers = new Map();
+        this.activeFilePaths = new Map(); // jobId -> Set(resolvedFilePath)
         this.queue = [];
         this.activeCount = 0;
         this.cleanupTimer = null;
+    }
+
+    isActiveStatus(status) {
+        return (
+            status === "queued" ||
+            status === "analyzing" ||
+            status === "downloading" ||
+            status === "merging"
+        );
+    }
+
+    getActiveCleanupExclusions() {
+        const activeJobIds = new Set();
+        const activeGuestIds = new Set();
+        const activeFilePaths = new Set();
+
+        for (const job of this.jobs.values()) {
+            if (!this.isActiveStatus(job.status)) continue;
+            activeJobIds.add(job.id);
+            if (job.guestId) activeGuestIds.add(job.guestId);
+            const tracked = this.activeFilePaths.get(job.id);
+            if (tracked) {
+                for (const p of tracked) activeFilePaths.add(p);
+            }
+        }
+
+        return { activeJobIds, activeGuestIds, activeFilePaths };
+    }
+
+    trackActiveFilePath(jobId, filePath) {
+        if (!filePath) return;
+        let set = this.activeFilePaths.get(jobId);
+        if (!set) {
+            set = new Set();
+            this.activeFilePaths.set(jobId, set);
+        }
+        set.add(path.resolve(filePath));
+    }
+
+    clearTrackedFilePaths(jobId) {
+        this.activeFilePaths.delete(jobId);
+    }
+
+    runCleanupCycle(nowMs = Date.now()) {
+        const exclusions = this.getActiveCleanupExclusions();
+        const storageResult = storage.cleanupExpiredStorage({
+            fileTtlMs: config.FILE_TTL_MS,
+            nowMs,
+            ...exclusions,
+        });
+        const prunedJobs = this.pruneOldJobs(config.JOB_RETENTION_MS, nowMs);
+        return { ...storageResult, prunedJobs };
     }
 
     startCleanupScheduler() {
         if (this.cleanupTimer) return;
         this.cleanupTimer = setInterval(() => {
             try {
-                storage.cleanupExpiredStorage({ fileTtlMs: config.FILE_TTL_MS });
-                this.pruneOldJobs(config.JOB_RETENTION_MS);
+                this.runCleanupCycle();
             } catch (err) {
                 console.error("[cleanup] Error during scheduled cleanup:", err.message);
             }
@@ -492,6 +544,7 @@ class JobManager extends EventEmitter {
 
         if (!response.ok || !response.body) {
             this.controllers.delete(id);
+            this.clearTrackedFilePaths(id);
             timeoutSignal?.removeEventListener("abort", onTimeoutAbort);
             throw new Error(`HTTP ${response.status} while downloading file`);
         }
@@ -514,6 +567,8 @@ class JobManager extends EventEmitter {
         );
         const finalPath = ensureUniquePath(guestDir, targetName);
         const partPath = `${finalPath}.part`;
+        this.trackActiveFilePath(id, partPath);
+        this.trackActiveFilePath(id, finalPath);
 
         const fileStream = fs.createWriteStream(partPath);
         const readable = Readable.fromWeb(response.body);
@@ -587,6 +642,7 @@ class JobManager extends EventEmitter {
             storage.assertStorageQuota(guestId, downloadedBytes);
             fs.renameSync(partPath, finalPath);
             this.controllers.delete(id);
+            this.clearTrackedFilePaths(id);
             timeoutSignal?.removeEventListener("abort", onTimeoutAbort);
 
             this.updateJob(id, {
@@ -602,6 +658,7 @@ class JobManager extends EventEmitter {
             });
         } catch (err) {
             this.controllers.delete(id);
+            this.clearTrackedFilePaths(id);
             timeoutSignal?.removeEventListener("abort", onTimeoutAbort);
             if (fs.existsSync(partPath)) {
                 try {

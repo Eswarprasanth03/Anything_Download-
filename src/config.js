@@ -6,7 +6,7 @@ const IS_PRODUCTION = NODE_ENV === "production";
 
 function parseBool(value, defaultValue) {
     if (value === undefined || value === null || value === "") return defaultValue;
-    return String(value).toLowerCase() === "true" || String(value) === "1";
+    return String(value).toLowerCase() === "true" || String(value).toLowerCase() === "1";
 }
 
 function parsePositiveInt(value, defaultValue) {
@@ -51,15 +51,16 @@ module.exports = {
     MAX_ACTIVE_PER_GUEST: parsePositiveInt(process.env.MAX_ACTIVE_PER_GUEST, 2),
     GUEST_ANALYZE_RATE_LIMIT: parsePositiveInt(process.env.GUEST_ANALYZE_RATE_LIMIT, 20),
     GUEST_DOWNLOAD_RATE_LIMIT: parsePositiveInt(process.env.GUEST_DOWNLOAD_RATE_LIMIT, 10),
-    MAX_DOWNLOAD_BYTES: parsePositiveInt(process.env.MAX_DOWNLOAD_BYTES, 500 * 1024 * 1024),
+    MAX_DOWNLOAD_BYTES: parsePositiveInt(process.env.MAX_DOWNLOAD_BYTES, 200 * 1024 * 1024),
     MAX_GUEST_STORAGE_BYTES: parsePositiveInt(
         process.env.MAX_GUEST_STORAGE_BYTES,
-        1024 * 1024 * 1024
+        300 * 1024 * 1024
     ),
     MAX_TOTAL_STORAGE_BYTES: parsePositiveInt(
         process.env.MAX_TOTAL_STORAGE_BYTES,
-        4 * 1024 * 1024 * 1024
+        768 * 1024 * 1024
     ),
+    MIN_FREE_DISK_BYTES: parsePositiveInt(process.env.MIN_FREE_DISK_BYTES, 100 * 1024 * 1024),
     JOB_TIMEOUT_MS: parsePositiveInt(process.env.JOB_TIMEOUT_MS, 5 * 60 * 1000),
     FILE_TTL_MS: parsePositiveInt(process.env.FILE_TTL_MS, 60 * 60 * 1000),
     JOB_RETENTION_MS: parsePositiveInt(process.env.JOB_RETENTION_MS, 60 * 60 * 1000),

@@ -24,6 +24,7 @@ RUN mkdir -p /app/downloads/guests
 
 ENV NODE_ENV=production
 ENV PUBLIC_HOSTED_MODE=true
+ENV DOWNLOADS_DIR=/app/downloads
 ENV PORT=10000
 
 EXPOSE 10000

@@ -19,12 +19,18 @@ services:
       - key: MAX_ACTIVE_PER_GUEST
         value: "2"
       - key: MAX_DOWNLOAD_BYTES
-        value: "524288000"
+        value: "209715200"
       - key: MAX_GUEST_STORAGE_BYTES
-        value: "1073741824"
+        value: "314572800"
       - key: MAX_TOTAL_STORAGE_BYTES
-        value: "4294967296"
+        value: "805306368"
+      - key: MIN_FREE_DISK_BYTES
+        value: "104857600"
       - key: FILE_TTL_MS
         value: "3600000"
+      - key: JOB_RETENTION_MS
+        value: "3600000"
+      - key: CLEANUP_INTERVAL_MS
+        value: "300000"
       - key: JOB_TIMEOUT_MS
         value: "300000"

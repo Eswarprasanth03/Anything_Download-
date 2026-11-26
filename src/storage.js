@@ -1,11 +1,40 @@
 const fs = require("fs");
 const path = require("path");
+const crypto = require("crypto");
 const mime = require("mime-types");
 const config = require("./config");
 const { isValidGuestId } = require("./guestSession");
 const { ensureDirSync, ensureUniquePath } = require("./utils");
 
 const GUESTS_ROOT_DIR = path.join(config.BASE_DOWNLOADS_DIR, "guests");
+
+function ensureStorageReady() {
+    ensureDirSync(config.BASE_DOWNLOADS_DIR);
+    ensureDirSync(GUESTS_ROOT_DIR);
+    const probePath = path.join(GUESTS_ROOT_DIR, `.write_probe_${crypto.randomUUID()}`);
+    fs.writeFileSync(probePath, "ok");
+    fs.unlinkSync(probePath);
+    return {
+        baseDir: config.BASE_DOWNLOADS_DIR,
+        guestsRootDir: GUESTS_ROOT_DIR,
+    };
+}
+
+function getAvailableDiskBytes() {
+    ensureDirSync(GUESTS_ROOT_DIR);
+    if (typeof fs.statfsSync !== "function") {
+        return null;
+    }
+    try {
+        const stats = fs.statfsSync(GUESTS_ROOT_DIR);
+        const blockSize = Number(stats.bsize || stats.frsize || 0);
+        const availBlocks = Number(stats.bavail ?? stats.bfree ?? 0);
+        if (!Number.isFinite(blockSize) || !Number.isFinite(availBlocks)) return null;
+        return blockSize * availBlocks;
+    } catch {
+        return null;
+    }
+}
 
 function getGuestDir(guestId) {
     if (!isValidGuestId(guestId)) {
@@ -47,7 +76,7 @@ function getTotalStorageUsage() {
     return getDirSizeBytes(GUESTS_ROOT_DIR);
 }
 
-function assertStorageQuota(guestId, additionalBytes = 0) {
+function assertStorageQuota(guestId, additionalBytes = 0, options = {}) {
     if (additionalBytes > config.MAX_DOWNLOAD_BYTES) {
         throw new Error(
             `File exceeds the maximum allowed size (${Math.round(config.MAX_DOWNLOAD_BYTES / (1024 * 1024))} MB).`
@@ -64,6 +93,19 @@ function assertStorageQuota(guestId, additionalBytes = 0) {
     const totalUsed = getTotalStorageUsage();
     if (totalUsed + additionalBytes > config.MAX_TOTAL_STORAGE_BYTES) {
         throw new Error("Server temporary storage is currently full. Please try again shortly.");
+    }
+
+    const availableDiskBytes =
+        options.availableDiskBytes !== undefined
+            ? options.availableDiskBytes
+            : getAvailableDiskBytes();
+    if (
+        Number.isFinite(availableDiskBytes) &&
+        availableDiskBytes - additionalBytes < config.MIN_FREE_DISK_BYTES
+    ) {
+        throw new Error(
+            "Server temporary disk capacity is currently low. Please try again after cleanup."
+        );
     }
 }
 
@@ -95,8 +137,18 @@ function listGuestFiles(guestId) {
 
 function resolveGuestFile(guestId, rawName) {
     const guestDir = getGuestDir(guestId);
-    const baseName = path.basename(String(rawName || ""));
-    if (!baseName || baseName === "." || baseName === ".." || baseName.startsWith(".")) {
+    const cleanRaw = String(rawName || "");
+    if (!cleanRaw || cleanRaw.includes("\0")) {
+        return null;
+    }
+    const baseName = path.basename(cleanRaw);
+    if (
+        !baseName ||
+        baseName === "." ||
+        baseName === ".." ||
+        baseName.startsWith(".") ||
+        baseName.endsWith(".part")
+    ) {
         return null;
     }
     const target = path.resolve(guestDir, baseName);
@@ -108,11 +160,16 @@ function resolveGuestFile(guestId, rawName) {
 
 function deleteGuestFile(guestId, rawName) {
     const target = resolveGuestFile(guestId, rawName);
-    if (!target || !fs.existsSync(target)) {
-        return false;
+    if (!target) return false;
+    try {
+        const stat = fs.statSync(target);
+        if (!stat.isFile()) return false;
+        fs.unlinkSync(target);
+        return true;
+    } catch (err) {
+        if (err && err.code === "ENOENT") return false;
+        throw err;
     }
-    fs.unlinkSync(target);
-    return true;
 }
 
 function moveIntoGuestStorage(guestId, sourcePath, desiredFilename) {
@@ -128,7 +185,13 @@ function moveIntoGuestStorage(guestId, sourcePath, desiredFilename) {
     };
 }
 
-function cleanupExpiredStorage({ fileTtlMs = config.FILE_TTL_MS, nowMs = Date.now() } = {}) {
+function cleanupExpiredStorage({
+    fileTtlMs = config.FILE_TTL_MS,
+    nowMs = Date.now(),
+    activeJobIds = new Set(),
+    activeFilePaths = new Set(),
+    activeGuestIds = new Set(),
+} = {}) {
     ensureDirSync(GUESTS_ROOT_DIR);
     let removedFiles = 0;
     let removedDirs = 0;
@@ -141,29 +204,46 @@ function cleanupExpiredStorage({ fileTtlMs = config.FILE_TTL_MS, nowMs = Date.no
         const items = fs.readdirSync(guestPath, { withFileTypes: true });
         for (const item of items) {
             const itemPath = path.join(guestPath, item.name);
+            const resolvedItemPath = path.resolve(itemPath);
+
             try {
-                const stat = fs.statSync(itemPath);
-                const ageMs = nowMs - stat.mtimeMs;
-                if (item.isDirectory() && item.name.startsWith(".staging_") && ageMs > Math.min(fileTtlMs, 30 * 60 * 1000)) {
-                    fs.rmSync(itemPath, { recursive: true, force: true });
-                    removedDirs += 1;
-                } else if (item.isFile() && ageMs > fileTtlMs) {
-                    fs.unlinkSync(itemPath);
-                    removedFiles += 1;
+                if (item.isDirectory() && item.name.startsWith(".staging_")) {
+                    const jobId = item.name.slice(".staging_".length);
+                    if (activeJobIds.has(jobId)) continue;
+
+                    const stat = fs.statSync(itemPath);
+                    const ageMs = nowMs - stat.mtimeMs;
+                    if (ageMs > Math.min(fileTtlMs, 30 * 60 * 1000)) {
+                        fs.rmSync(itemPath, { recursive: true, force: true });
+                        removedDirs += 1;
+                    }
+                    continue;
+                }
+
+                if (item.isFile()) {
+                    if (activeFilePaths.has(resolvedItemPath)) continue;
+                    const stat = fs.statSync(itemPath);
+                    const ageMs = nowMs - stat.mtimeMs;
+                    if (ageMs > fileTtlMs) {
+                        fs.unlinkSync(itemPath);
+                        removedFiles += 1;
+                    }
                 }
             } catch {
                 // Ignore concurrent deletion
             }
         }
 
-        try {
-            const remaining = fs.readdirSync(guestPath);
-            if (remaining.length === 0) {
-                fs.rmdirSync(guestPath);
-                removedDirs += 1;
+        if (!activeGuestIds.has(gEntry.name)) {
+            try {
+                const remaining = fs.readdirSync(guestPath);
+                if (remaining.length === 0) {
+                    fs.rmdirSync(guestPath);
+                    removedDirs += 1;
+                }
+            } catch {
+                // Ignore non-empty or concurrent errors
             }
-        } catch {
-            // Ignore non-empty or concurrent errors
         }
     }
 
@@ -172,6 +252,8 @@ function cleanupExpiredStorage({ fileTtlMs = config.FILE_TTL_MS, nowMs = Date.no
 
 module.exports = {
     GUESTS_ROOT_DIR,
+    ensureStorageReady,
+    getAvailableDiskBytes,
     getGuestDir,
     getGuestStorageUsage,
     getTotalStorageUsage,

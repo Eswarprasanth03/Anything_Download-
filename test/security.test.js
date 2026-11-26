@@ -9,6 +9,7 @@ process.env.NODE_ENV = "production";
 process.env.SESSION_SECRET = "test-secret-for-security-suite-32bytes";
 
 const app = require("../server");
+const config = require("../src/config");
 const {
     generateGuestId,
     createSignedGuestToken,
@@ -269,13 +270,108 @@ async function run() {
         jobManager.jobs.delete(jobAId);
         jobManager.jobs.delete(jobBId);
 
-        // Cleanup removes expired guest files
-        const cleanupRes = storage.cleanupExpiredStorage({
-            fileTtlMs: 1000,
-            nowMs: Date.now() + 5000,
+        // Missing or deleted files return clear 404 without crashing
+        const missingGet = await fetch(`${api.baseUrl}/api/files/nonexistent.mp4`, {
+            headers: { Cookie: guestACookie },
         });
-        assert.ok(cleanupRes.removedFiles >= 2);
+        assert.strictEqual(missingGet.status, 404);
+        assert.match((await missingGet.json()).error, /not found/i);
+
+        const missingInline = await fetch(`${api.baseUrl}/api/files/nonexistent.mp4?inline=1`, {
+            headers: { Cookie: guestACookie },
+        });
+        assert.strictEqual(missingInline.status, 404);
+
+        const missingDel = await fetch(`${api.baseUrl}/api/files/nonexistent.mp4`, {
+            method: "DELETE",
+            headers: { Cookie: guestACookie },
+        });
+        assert.strictEqual(missingDel.status, 404);
+
+        // Verify Render Free TTL, cleanup interval, storage bounds & writability
+        assert.strictEqual(config.FILE_TTL_MS, 60 * 60 * 1000);
+        assert.strictEqual(config.CLEANUP_INTERVAL_MS, 5 * 60 * 1000);
+        assert.ok(config.MAX_TOTAL_STORAGE_BYTES <= 1024 * 1024 * 1024);
+        const readyPaths = storage.ensureStorageReady();
+        assert.ok(readyPaths.guestsRootDir.endsWith(path.join("downloads", "guests")));
+
+        // Verify storage quota & real disk availability checks
+        assert.throws(
+            () => storage.assertStorageQuota(guestAId, config.MAX_DOWNLOAD_BYTES + 1),
+            /maximum allowed size/i
+        );
+        assert.throws(
+            () => storage.assertStorageQuota(guestAId, 1024, { availableDiskBytes: config.MIN_FREE_DISK_BYTES }),
+            /disk capacity is currently low/i
+        );
+        const origGuestMax = config.MAX_GUEST_STORAGE_BYTES;
+        const origTotalMax = config.MAX_TOTAL_STORAGE_BYTES;
+        try {
+            config.MAX_GUEST_STORAGE_BYTES = 10;
+            assert.throws(
+                () => storage.assertStorageQuota(guestAId, 1, { availableDiskBytes: 10 * 1024 * 1024 * 1024 }),
+                /guest storage quota is full/i
+            );
+            config.MAX_GUEST_STORAGE_BYTES = origGuestMax;
+            config.MAX_TOTAL_STORAGE_BYTES = 10;
+            assert.throws(
+                () => storage.assertStorageQuota(guestAId, 1, { availableDiskBytes: 10 * 1024 * 1024 * 1024 }),
+                /server temporary storage is currently full/i
+            );
+        } finally {
+            config.MAX_GUEST_STORAGE_BYTES = origGuestMax;
+            config.MAX_TOTAL_STORAGE_BYTES = origTotalMax;
+        }
+
+        // Cleanup removes expired files & expired terminal jobs, while protecting active downloads
+        const activeJobId = "active_dl_1";
+        const expiredJobId = "expired_done_1";
+        const guestBDir = storage.getGuestDir(guestBId);
+        const activePartPath = path.join(guestBDir, "in_progress.mp4.part");
+        const activeStagingDir = path.join(guestBDir, `.staging_${activeJobId}`);
+        fs.writeFileSync(activePartPath, "partial-bytes");
+        fs.mkdirSync(activeStagingDir, { recursive: true });
+        fs.writeFileSync(path.join(activeStagingDir, "frag.ts"), "fragment");
+
+        const oldIso = new Date(Date.now() - 2 * config.FILE_TTL_MS).toISOString();
+        jobManager.jobs.set(activeJobId, {
+            id: activeJobId,
+            guestId: guestBId,
+            url: "https://example.com/active.mp4",
+            status: "downloading",
+            createdAt: oldIso,
+            updatedAt: oldIso,
+        });
+        jobManager.trackActiveFilePath(activeJobId, activePartPath);
+
+        jobManager.jobs.set(expiredJobId, {
+            id: expiredJobId,
+            guestId: guestAId,
+            url: "https://example.com/old.mp4",
+            status: "completed",
+            filename: "secret.txt",
+            createdAt: oldIso,
+            updatedAt: oldIso,
+        });
+
+        const cycleRes = jobManager.runCleanupCycle(Date.now() + 2 * config.FILE_TTL_MS);
+        assert.ok(cycleRes.removedFiles >= 2);
+        assert.ok(cycleRes.prunedJobs >= 1);
         assert.strictEqual(storage.listGuestFiles(guestAId).length, 0);
+        assert.strictEqual(jobManager.getJob(expiredJobId), null);
+
+        // Active download files, staging dir, and active job record MUST survive cleanup
+        assert.strictEqual(fs.existsSync(activePartPath), true);
+        assert.strictEqual(fs.existsSync(activeStagingDir), true);
+        assert.ok(jobManager.getJob(activeJobId));
+        jobManager.clearTrackedFilePaths(activeJobId);
+        jobManager.jobs.delete(activeJobId);
+
+        // Fetching an expired/deleted file returns 404
+        const expiredGet = await fetch(`${api.baseUrl}/api/files/secret.txt`, {
+            headers: { Cookie: guestACookie },
+        });
+        assert.strictEqual(expiredGet.status, 404);
 
         console.log("ALL GUEST ISOLATION, SSRF, COOKIE POLICY & SECURITY TESTS PASSED");
     } finally {

@@ -10,9 +10,8 @@ const { requireGuestSession } = require("./src/guestSession");
 const { analyzeUrl } = require("./src/analyzer");
 const jobManager = require("./src/jobManager");
 const storage = require("./src/storage");
-const { ensureDirSync } = require("./src/utils");
 
-ensureDirSync(config.BASE_DOWNLOADS_DIR);
+storage.ensureStorageReady();
 
 const app = express();
 app.set("trust proxy", 1);
@@ -34,6 +33,7 @@ function applyCors(req, res, next) {
         res.setHeader("Access-Control-Allow-Credentials", "true");
         res.setHeader("Access-Control-Allow-Methods", "GET,POST,DELETE,OPTIONS");
         res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+        res.setHeader("Access-Control-Expose-Headers", "Content-Disposition, Content-Length");
         res.setHeader("Vary", "Origin");
         if (req.method === "OPTIONS") {
             return res.status(204).end();
@@ -181,7 +181,17 @@ app.get("/api/files", requireGuestSession, (req, res) => {
 
 app.get("/api/files/:name", requireGuestSession, (req, res) => {
     const filePath = storage.resolveGuestFile(req.guestId, req.params.name);
-    if (!filePath || !fs.existsSync(filePath)) {
+    if (!filePath) {
+        return res.status(404).json({ error: "File not found" });
+    }
+
+    let stat;
+    try {
+        stat = fs.statSync(filePath);
+    } catch {
+        return res.status(404).json({ error: "File not found or expired" });
+    }
+    if (!stat.isFile()) {
         return res.status(404).json({ error: "File not found" });
     }
 
@@ -189,11 +199,20 @@ app.get("/api/files/:name", requireGuestSession, (req, res) => {
     res.setHeader("X-Content-Type-Options", "nosniff");
     res.setHeader("Cache-Control", "private, no-store");
 
+    const handleSendError = (err) => {
+        if (!err) return;
+        if (!res.headersSent) {
+            res.status(err.code === "ENOENT" ? 404 : 500).json({
+                error: err.code === "ENOENT" ? "File not found or expired" : "Failed to serve file",
+            });
+        }
+    };
+
     if (req.query.inline === "1" && !ACTIVE_INLINE_MIME_TYPES.has(detectedMime)) {
         res.setHeader("Content-Security-Policy", "default-src 'none'; sandbox");
-        return res.sendFile(filePath);
+        return res.sendFile(filePath, handleSendError);
     }
-    return res.download(filePath, path.basename(filePath));
+    return res.download(filePath, path.basename(filePath), handleSendError);
 });
 
 app.delete("/api/files/:name", requireGuestSession, (req, res) => {

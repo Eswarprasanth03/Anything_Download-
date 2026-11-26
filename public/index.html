@@ -5,15 +5,17 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <meta name="api-base-url" content="" />
     <title>Anything Download — Universal Link &amp; 4K Media Downloader</title>
+    <link rel="icon" type="image/svg+xml" href="/logo.svg" />
+    <link rel="apple-touch-icon" href="/logo.svg" />
     <link rel="stylesheet" href="/styles.css" />
 </head>
 <body>
     <div class="app-shell">
         <header class="topbar">
             <div class="brand">
-                <div class="brand-icon">↓</div>
+                <img src="/logo.svg" alt="Anything Download logo" class="brand-logo" width="46" height="46" />
                 <div>
-                    <h1>Universal Downloader</h1>
+                    <h1>Anything Download</h1>
                     <p class="subtitle">Download images, documents, archives, audio &amp; 4K / 1080p video from publicly accessible links</p>
                 </div>
             </div>
@@ -123,6 +125,23 @@
                 </div>
             </section>
         </main>
+    </div>
+
+    <div id="previewModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="previewModalTitle">
+        <div class="modal-dialog">
+            <div class="modal-header">
+                <div class="modal-title-wrap">
+                    <h3 id="previewModalTitle">File Preview</h3>
+                    <p id="previewModalMeta" class="section-sub"></p>
+                </div>
+                <button type="button" id="closePreviewModalBtn" class="btn btn-ghost btn-sm" aria-label="Close preview">✕</button>
+            </div>
+            <div id="previewModalBody" class="modal-body"></div>
+            <div class="modal-footer">
+                <a id="previewModalOpenTab" class="btn btn-secondary btn-sm" href="#" target="_blank" rel="noopener">Open in New Tab</a>
+                <a id="previewModalSaveBtn" class="btn btn-primary btn-sm" href="#" download>Save to Device</a>
+            </div>
+        </div>
     </div>
 
     <script src="/app.js"></script>

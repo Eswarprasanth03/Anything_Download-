@@ -217,6 +217,21 @@ async function run() {
         assert.strictEqual(htmlPreviewRes.headers.get("x-content-type-options"), "nosniff");
         assert.match(htmlPreviewRes.headers.get("content-disposition") || "", /attachment/i);
 
+        // Safe inline preview allows media/image/PDF playback without script execution
+        const safePreviewRes = await fetch(`${api.baseUrl}/api/files/secret.txt?inline=1`, {
+            headers: { Cookie: guestACookie },
+        });
+        assert.strictEqual(safePreviewRes.status, 200);
+        const csp = safePreviewRes.headers.get("content-security-policy") || "";
+        assert.ok(csp.includes("script-src 'none'"));
+        assert.ok(csp.includes("media-src 'self'"));
+        assert.ok(!csp.includes("sandbox"));
+
+        // Brand logo SVG served cleanly for header and favicon
+        const logoRes = await fetch(`${api.baseUrl}/logo.svg`);
+        assert.strictEqual(logoRes.status, 200);
+        assert.match(logoRes.headers.get("content-type") || "", /image\/svg\+xml/i);
+
         // Job & cancellation isolation between Guest A and Guest B
         const jobAId = "testjob_a_1";
         jobManager.jobs.set(jobAId, {

@@ -20,6 +20,13 @@ const jobCount = document.getElementById("jobCount");
 const filesList = document.getElementById("filesList");
 const downloadsDirLabel = document.getElementById("downloadsDirLabel");
 const refreshFilesBtn = document.getElementById("refreshFilesBtn");
+const previewModal = document.getElementById("previewModal");
+const previewModalTitle = document.getElementById("previewModalTitle");
+const previewModalMeta = document.getElementById("previewModalMeta");
+const previewModalBody = document.getElementById("previewModalBody");
+const previewModalOpenTab = document.getElementById("previewModalOpenTab");
+const previewModalSaveBtn = document.getElementById("previewModalSaveBtn");
+const closePreviewModalBtn = document.getElementById("closePreviewModalBtn");
 
 const jobsMap = new Map();
 let selectedContentType = "auto";
@@ -216,7 +223,7 @@ function renderPreview(info) {
         const isImage = info.category === "image" || (info.mimeType || "").startsWith("image/");
         previewCard.innerHTML = `
             <div class="preview-layout">
-                ${isImage ? `<img class="direct-image-preview" src="${escapeHtml(info.url)}" alt="${escapeHtml(info.filename)}" />` : ""}
+                ${isImage ? `<img class="direct-image-preview" src="${escapeHtml(info.url)}" alt="${escapeHtml(info.filename)}" referrerpolicy="no-referrer" onerror="this.style.display='none'" />` : ""}
                 <div class="preview-info">
                     <h3>Direct ${escapeHtml((info.category || "file").toUpperCase())}: ${escapeHtml(info.filename)}</h3>
                     <div class="preview-meta">
@@ -241,7 +248,7 @@ function renderPreview(info) {
             .map(
                 (item, idx) => `
                 <div class="gallery-card">
-                    ${item.category === "image" ? `<img src="${escapeHtml(item.url)}" alt="Item ${idx + 1}" loading="lazy" />` : ""}
+                    ${item.category === "image" ? `<img src="${escapeHtml(item.url)}" alt="Item ${idx + 1}" loading="lazy" referrerpolicy="no-referrer" onerror="this.style.display='none'" />` : ""}
                     <div class="file-meta">${escapeHtml(item.ext.toUpperCase())}${item.width && item.height ? ` · ${item.width}×${item.height}` : ""}</div>
                     <button type="button" class="btn btn-secondary btn-sm" data-quick-url="${escapeHtml(item.url)}" data-quick-direct="1">
                         Download #${idx + 1}
@@ -279,7 +286,7 @@ function renderPreview(info) {
                 (asset) => `
                 <div class="asset-item">
                     <div class="asset-left">
-                        ${asset.category === "image" ? `<img class="asset-thumb" src="${escapeHtml(asset.url)}" alt="" loading="lazy" />` : ""}
+                        ${asset.category === "image" ? `<img class="asset-thumb" src="${escapeHtml(asset.url)}" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.style.display='none'" />` : ""}
                         <div>
                             <div class="file-name">${escapeHtml(asset.filename)}</div>
                             <div class="file-meta">${escapeHtml((asset.category || "file").toUpperCase())} · ${escapeHtml(asset.ext.toUpperCase())} · ${escapeHtml(asset.url)}</div>
@@ -339,7 +346,7 @@ function renderPreview(info) {
 
     previewCard.innerHTML = `
         <div class="preview-layout">
-            ${info.thumbnail ? `<img class="preview-thumb" src="${escapeHtml(info.thumbnail)}" alt="Thumbnail" />` : ""}
+            ${info.thumbnail ? `<img class="preview-thumb" src="${escapeHtml(info.thumbnail)}" alt="Thumbnail" referrerpolicy="no-referrer" onerror="this.style.display='none'" />` : ""}
             <div class="preview-info">
                 <h3>${escapeHtml(info.title)}</h3>
                 <div class="preview-meta">
@@ -530,7 +537,7 @@ async function loadFiles() {
                         </div>
                     </div>
                     <div class="file-actions">
-                        <a class="btn btn-secondary btn-sm" href="${escapeHtml(inlineUrl)}" target="_blank" rel="noopener">Preview</a>
+                        <button type="button" class="btn btn-secondary btn-sm" data-preview-file="${escapeHtml(file.name)}" data-preview-mime="${escapeHtml(file.mimeType)}" data-preview-size="${escapeHtml(file.size)}">Preview</button>
                         <a class="btn btn-primary btn-sm" href="${escapeHtml(downloadUrl)}" download="${escapeHtml(file.name)}">Save to Device</a>
                         ${shareBtn}
                         <button type="button" class="btn btn-danger btn-sm" data-delete-file="${escapeHtml(file.name)}">Delete</button>
@@ -539,6 +546,16 @@ async function loadFiles() {
             `;
             })
             .join("");
+
+        filesList.querySelectorAll("[data-preview-file]").forEach((btn) => {
+            btn.addEventListener("click", () => {
+                openFilePreviewModal({
+                    name: btn.getAttribute("data-preview-file"),
+                    mimeType: btn.getAttribute("data-preview-mime"),
+                    size: Number(btn.getAttribute("data-preview-size")),
+                });
+            });
+        });
 
         filesList.querySelectorAll("[data-share-file]").forEach((btn) => {
             btn.addEventListener("click", () => {
@@ -656,6 +673,101 @@ refreshFilesBtn.addEventListener("click", loadFiles);
 downloadForm.addEventListener("submit", (e) => {
     e.preventDefault();
     startDownload();
+});
+
+function closeFilePreviewModal() {
+    previewModalBody.innerHTML = "";
+    previewModal.classList.add("hidden");
+}
+
+async function openFilePreviewModal(file) {
+    const inlineUrl = apiUrl(`/api/files/${encodeURIComponent(file.name)}?inline=1`);
+    const downloadUrl = apiUrl(`/api/files/${encodeURIComponent(file.name)}`);
+    const mimeType = (file.mimeType || "application/octet-stream").toLowerCase();
+
+    previewModalTitle.textContent = file.name;
+    previewModalMeta.textContent = `${formatBytes(file.size)} · ${mimeType}`;
+    previewModalOpenTab.href = inlineUrl;
+    previewModalSaveBtn.href = downloadUrl;
+    previewModalSaveBtn.setAttribute("download", file.name);
+    previewModalBody.innerHTML = `<div class="empty-state">Loading preview...</div>`;
+    previewModal.classList.remove("hidden");
+
+    if (mimeType.startsWith("image/") && mimeType !== "image/svg+xml") {
+        const img = document.createElement("img");
+        img.className = "modal-preview-image";
+        img.src = inlineUrl;
+        img.alt = file.name;
+        img.onerror = () => {
+            previewModalBody.innerHTML = `<div class="empty-state">Image preview failed to load. Tap "Save to Device" to view locally.</div>`;
+        };
+        previewModalBody.innerHTML = "";
+        previewModalBody.appendChild(img);
+        return;
+    }
+
+    if (mimeType.startsWith("video/")) {
+        const video = document.createElement("video");
+        video.className = "modal-preview-video";
+        video.src = inlineUrl;
+        video.controls = true;
+        video.playsInline = true;
+        video.preload = "metadata";
+        video.onerror = () => {
+            previewModalBody.innerHTML = `<div class="empty-state">This video codec cannot be played in-browser. Tap "Save to Device" to play locally.</div>`;
+        };
+        previewModalBody.innerHTML = "";
+        previewModalBody.appendChild(video);
+        return;
+    }
+
+    if (mimeType.startsWith("audio/")) {
+        const audio = document.createElement("audio");
+        audio.className = "modal-preview-audio";
+        audio.src = inlineUrl;
+        audio.controls = true;
+        previewModalBody.innerHTML = "";
+        previewModalBody.appendChild(audio);
+        return;
+    }
+
+    if (mimeType === "application/pdf") {
+        const frame = document.createElement("iframe");
+        frame.className = "modal-preview-pdf";
+        frame.src = inlineUrl;
+        frame.title = file.name;
+        previewModalBody.innerHTML = "";
+        previewModalBody.appendChild(frame);
+        return;
+    }
+
+    if (mimeType === "text/plain" || mimeType === "text/csv" || mimeType === "application/json") {
+        try {
+            const res = await apiFetch(`/api/files/${encodeURIComponent(file.name)}?inline=1`);
+            if (!res.ok) throw new Error("Unable to load file preview");
+            const text = (await res.text()).slice(0, 128 * 1024);
+            const pre = document.createElement("pre");
+            pre.className = "modal-preview-text";
+            pre.textContent = text;
+            previewModalBody.innerHTML = "";
+            previewModalBody.appendChild(pre);
+        } catch {
+            previewModalBody.innerHTML = `<div class="empty-state">Preview unavailable. Tap "Save to Device" to open locally.</div>`;
+        }
+        return;
+    }
+
+    previewModalBody.innerHTML = `<div class="empty-state">In-browser preview is not available for ${escapeHtml(mimeType)}. Tap "Save to Device" to download it.</div>`;
+}
+
+closePreviewModalBtn.addEventListener("click", closeFilePreviewModal);
+previewModal.addEventListener("click", (e) => {
+    if (e.target === previewModal) closeFilePreviewModal();
+});
+document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && !previewModal.classList.contains("hidden")) {
+        closeFilePreviewModal();
+    }
 });
 
 loadHealth().then(() => {

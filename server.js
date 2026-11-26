@@ -209,7 +209,10 @@ app.get("/api/files/:name", requireGuestSession, (req, res) => {
     };
 
     if (req.query.inline === "1" && !ACTIVE_INLINE_MIME_TYPES.has(detectedMime)) {
-        res.setHeader("Content-Security-Policy", "default-src 'none'; sandbox");
+        res.setHeader(
+            "Content-Security-Policy",
+            "default-src 'self'; media-src 'self' blob:; img-src 'self' data: blob:; style-src 'unsafe-inline'; object-src 'self'; script-src 'none'"
+        );
         return res.sendFile(filePath, handleSendError);
     }
     return res.download(filePath, path.basename(filePath), handleSendError);
